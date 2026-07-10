@@ -41,6 +41,13 @@ def record_hash(record: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(record).encode("utf-8")).hexdigest()
 
 
+def _ensure_json_safe(record: Dict[str, Any], *, error_message: str) -> None:
+    try:
+        json.dumps(record, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise SnapshotLedgerError(error_message) from exc
+
+
 class SnapshotLedger:
     """Append-only JSONL ledger for structured observations and revisions."""
 
@@ -120,8 +127,7 @@ class SnapshotLedger:
             "validation_errors": list(errors),
             "execution_authority": False,
         }
-        if '"execution_authority":true' in canonical_json(entry).replace(" ", ""):
-            raise SnapshotLedgerError("validation failure evidence cannot carry execution_authority=true")
+        _ensure_json_safe(entry, error_message="validation-failure evidence is not JSON serializable")
         return self._append_entry(entry)
 
     def find(self, observation_id: str) -> Optional[Dict[str, Any]]:

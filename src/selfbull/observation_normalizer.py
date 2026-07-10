@@ -52,6 +52,23 @@ def _number_or_none(value: Any) -> Optional[float]:
         raise ValueError(f"market value must be numeric or null, got {value!r}") from exc
 
 
+def _normalization_issue(message: str, *, normalized: StructuredObservation) -> StructuredObservation:
+    """Attach a clean normalization issue while preserving the evidence shape."""
+    return StructuredObservation(
+        observation_id=normalized.observation_id,
+        observed_at=normalized.observed_at,
+        recorded_at=normalized.recorded_at,
+        observer=normalized.observer,
+        source=normalized.source,
+        instrument=normalized.instrument,
+        market_state=normalized.market_state,
+        observation_type=normalized.observation_type,
+        confidence=normalized.confidence,
+        unknown_fields=[*normalized.unknown_fields, message],
+        notes=normalized.notes,
+    )
+
+
 def normalize_observation(raw: Mapping[str, Any]) -> StructuredObservation:
     """Create a structured observation without fabricating missing values."""
     if not isinstance(raw, Mapping):
@@ -72,7 +89,10 @@ def normalize_observation(raw: Mapping[str, Any]) -> StructuredObservation:
         field_name: _number_or_none(market_raw.get(field_name))
         for field_name in MARKET_STATE_FIELDS
     }
-    unknown = sorted(set(raw) - _TOP_LEVEL_FIELDS)
+    unknown = sorted(
+        key for key in raw if isinstance(key, str) and key not in _TOP_LEVEL_FIELDS
+    )
+    non_string_key_issue = any(not isinstance(key, str) for key in raw)
     supplied_unknown = raw.get("unknown_fields") or []
     if supplied_unknown:
         unknown.extend(str(field) for field in supplied_unknown)
@@ -102,7 +122,10 @@ def normalize_observation(raw: Mapping[str, Any]) -> StructuredObservation:
     }
     if raw.get("observation_id"):
         values["observation_id"] = str(raw["observation_id"])
-    return StructuredObservation(**values)
+    observation = StructuredObservation(**values)
+    if non_string_key_issue:
+        return _normalization_issue("non-string field keys are not permitted", normalized=observation)
+    return observation
 
 
 def normalize_manual_envelope(envelope: Mapping[str, Any], *, recorded_at: str) -> StructuredObservation:

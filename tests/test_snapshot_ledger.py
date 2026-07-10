@@ -75,6 +75,31 @@ class TestSnapshotLedger(unittest.TestCase):
                 reason="bad correction",
             )
 
+    def test_validation_failure_rejects_non_json_serializable_evidence_cleanly(self):
+        class X:
+            pass
+
+        with self.assertRaises(SnapshotLedgerError) as ctx:
+            self.ledger.append_validation_failure(
+                raw_observation={"observation_id": "selfbull-obs-bad", "source": {"x": X()}},
+                errors=["source.account_context is required"],
+                recorded_at="2026-07-10T18:40:00Z",
+            )
+
+        self.assertIn("validation-failure evidence is not JSON serializable", str(ctx.exception))
+        self.assertFalse(self.path.exists())
+
+    def test_json_safe_validation_failure_still_appends(self):
+        receipt = self.ledger.append_validation_failure(
+            raw_observation={"observation_id": "selfbull-obs-bad", "source": {"platform": "webull"}},
+            errors=["source.account_context is required"],
+            recorded_at="2026-07-10T18:40:00Z",
+        )
+
+        self.assertEqual(receipt.entry_type, "validation_failure")
+        self.assertTrue(self.path.exists())
+        self.assertEqual(len(self.path.read_text(encoding="utf-8").splitlines()), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

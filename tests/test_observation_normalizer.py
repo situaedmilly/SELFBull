@@ -93,6 +93,49 @@ class TestObservationNormalizer(unittest.TestCase):
         self.assertTrue(obs.observation_id.startswith("selfbull-obs-"))
         self.assertTrue(validate_observation(obs).valid)
 
+    def test_mixed_string_integer_keys_do_not_raise(self):
+        raw = {
+            1: "malformed",
+            "foo": "unknown",
+            "observed_at": "2026-07-10T18:30:00Z",
+            "recorded_at": "2026-07-10T18:31:12Z",
+            "observer": "human",
+            "source": {
+                "platform": "webull",
+                "surface": "browser",
+                "account_context": "manual_view_only",
+            },
+            "instrument": {"symbol": "SPY", "asset_class": "equity"},
+            "market_state": {},
+        }
+
+        obs = normalize_observation(raw)
+
+        self.assertIn("non-string field keys are not permitted", obs.unknown_fields)
+        self.assertEqual(obs.unknown_fields[-1], "non-string field keys are not permitted")
+        self.assertIn("foo", obs.unknown_fields)
+        self.assertEqual(raw[1], "malformed")
+
+    def test_unknown_string_keys_remain_sorted(self):
+        raw = {
+            "zeta": "1",
+            "alpha": "2",
+            "observed_at": "2026-07-10T18:30:00Z",
+            "recorded_at": "2026-07-10T18:31:12Z",
+            "observer": "human",
+            "source": {
+                "platform": "webull",
+                "surface": "browser",
+                "account_context": "manual_view_only",
+            },
+            "instrument": {"symbol": "SPY", "asset_class": "equity"},
+            "market_state": {},
+        }
+
+        obs = normalize_observation(raw)
+
+        self.assertEqual(obs.unknown_fields, ["alpha", "zeta"])
+
 
 if __name__ == "__main__":
     unittest.main()
