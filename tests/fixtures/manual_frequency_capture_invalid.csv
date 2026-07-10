@@ -1,0 +1,3 @@
+timestamp_et,symbol,last_price,day_open,day_high,day_low,previous_close,volume,relative_volume,bid,ask,spread,implied_volatility,expected_move,call_wall,put_wall,largest_call_volume_strike,largest_put_volume_strike,session,source,notes
+2026-07-09 09:35:00,SPY,500.25,499.10,501.40,498.60,498.90,4200000,1.1,500.24,500.26,0.02,14.2,3.5,505,495,505,495,core,webull_browser_manual,FICTIONAL EXAMPLE — valid row inside an otherwise-invalid batch
+not-a-timestamp,spy,-500.25,,,,,lots,,,,,nan,,,,,,core,wrong_source,FICTIONAL EXAMPLE — intentionally invalid fixture row (bad timestamp/price/volume/IV/source)

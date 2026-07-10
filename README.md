@@ -20,6 +20,26 @@ not do.
 Offline. Unauthenticated. Non-networked. Non-executing. Independently
 testable. Contract-driven. Standard-library only.
 
+## Phase 1.1 — manual browser observation intake (SELFBULL-002)
+
+SELFBull can now ingest **manually observed** Webull browser data into
+validated, source-labeled, broker-neutral `MarketObservationEnvelope`
+records (`source = webull_browser_manual`, capture mode
+`MANUAL_BROWSER_OBSERVATION`), stored append-only in a local, gitignored
+JSONL file. No live Webull API connection exists. No credential plane
+exists. No execution authority exists. No trade is recommended or
+transmitted.
+
+```
+python3 -m selfbull.manual_capture validate --file data/examples/manual_frequency_capture.csv
+python3 -m selfbull.manual_capture ingest   --file my_capture.csv [--dry-run] [--json]
+python3 -m selfbull.manual_capture single   --timestamp-et "2026-07-10 09:35:00" \
+    --symbol SPY --last-price 632.14 --source webull_browser_manual
+```
+
+See `docs/SELFBULL-MANUAL-OBSERVATION-SPEC.md` (validation and envelope
+rules) and `docs/SELFBULL-MOBILE-CAPTURE-GUIDE.md` (operator how-to).
+
 ## Boundary law
 
 - SELFBull MUST NOT import SELFQUANT.
