@@ -204,7 +204,11 @@ def parse_observation(raw: Dict[str, Any], *, now: Optional[datetime] = None) ->
     errors = result.errors
     conflicts: List[str] = []
 
-    unknown = sorted(set(raw) - set(ALL_FIELDS))
+    overflow_keys = [key for key in raw if not isinstance(key, str)]
+    if overflow_keys:
+        errors.append("extra CSV columns detected beyond declared header")
+
+    unknown = sorted(key for key in raw if isinstance(key, str) and key not in ALL_FIELDS)
     if unknown:
         result.warnings.append(f"unrecognized fields ignored: {', '.join(unknown)}")
 

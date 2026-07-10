@@ -63,6 +63,23 @@ class TestRequiredFields(unittest.TestCase):
         self.assertEqual(parsed.normalized["symbol"], "SPY")
         self.assertEqual(parsed.normalized["last_price"], 500.25)
 
+    def test_dictreader_overflow_key_is_invalid_without_traceback(self):
+        row = valid_row()
+        row[None] = ["extra fragment"]
+
+        parsed = parse_observation(row, now=NOW)
+
+        self.assertEqual(parsed.validation_status, INVALID)
+        self.assertTrue(
+            any("extra CSV columns detected beyond declared header" in e for e in parsed.errors)
+        )
+        self.assertIn(None, parsed.raw)
+        self.assertEqual(parsed.raw[None], "['extra fragment']")
+
+        valid = parse_observation(valid_row(), now=NOW)
+        self.assertEqual(valid.validation_status, VALID)
+        self.assertEqual(valid.errors, [])
+
     def test_missing_last_price_fails(self):
         parsed = parse_observation(valid_row(last_price=""), now=NOW)
         self.assertEqual(parsed.validation_status, INVALID)

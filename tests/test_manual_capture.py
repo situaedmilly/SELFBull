@@ -29,6 +29,7 @@ EXAMPLE_CSV = REPO_ROOT / "data" / "examples" / "manual_frequency_capture.csv"
 INVALID_FIXTURE_CSV = Path(__file__).parent / "fixtures" / "manual_frequency_capture_invalid.csv"
 
 _real_socket = socket.socket
+_real_create_connection = socket.create_connection
 
 
 def _no_network(*_args, **_kwargs):
@@ -42,7 +43,7 @@ def setUpModule():
 
 def tearDownModule():
     socket.socket = _real_socket                     # type: ignore[assignment]
-    socket.create_connection = socket.create_connection  # restored via socket reload semantics
+    socket.create_connection = _real_create_connection  # type: ignore[assignment]
 
 
 def run_cli(argv):
@@ -108,6 +109,23 @@ class TestIngestCommand(unittest.TestCase):
             "ingest", "--file", str(INVALID_FIXTURE_CSV), "--store-path", str(self.store_path),
         ])
         self.assertEqual(code, 1)
+        self.assertFalse(self.store_path.exists())
+
+    def test_extra_csv_columns_fail_cleanly_and_write_nothing(self):
+        bad_csv = Path(self._tmp.name) / "bad.csv"
+        bad_csv.write_text(
+            "timestamp_et,symbol,last_price,source,notes\n"
+            "2026-07-10 09:35:00,SPY,632.14,webull_browser_manual,opening range,extra fragment\n",
+            encoding="utf-8",
+        )
+
+        code, out, err = run_cli([
+            "ingest", "--file", str(bad_csv), "--store-path", str(self.store_path),
+        ])
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("extra CSV columns detected beyond declared header", out + err)
+        self.assertNotIn("Traceback", out + err)
         self.assertFalse(self.store_path.exists())
 
     def test_repeated_ingest_appends_without_rewriting(self):
@@ -204,6 +222,15 @@ class TestOfflineWitness(unittest.TestCase):
             self.assertNotIn("canary-value-must-not-leak", out + err)
         finally:
             del os.environ["SELFBULL_TEST_CANARY"]
+
+    def test_create_connection_teardown_restores_exact_original_object(self):
+        self.assertIs(socket.create_connection, _no_network)
+        tearDownModule()
+        try:
+            self.assertIs(socket.create_connection, _real_create_connection)
+        finally:
+            setUpModule()
+        self.assertIs(socket.create_connection, _no_network)
 
 
 if __name__ == "__main__":
