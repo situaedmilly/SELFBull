@@ -1,0 +1,5 @@
+timestamp_et,symbol,last_price,day_open,day_high,day_low,previous_close,volume,relative_volume,bid,ask,spread,implied_volatility,expected_move,call_wall,put_wall,largest_call_volume_strike,largest_put_volume_strike,session,source,notes
+2026-07-09 09:35:00,SPY,500.25,499.10,501.40,498.60,498.90,4200000,1.1,500.24,500.26,0.02,14.2,3.5,505,495,505,495,core,webull_browser_manual,FICTIONAL EXAMPLE — not real market data; opening-range observation template
+2026-07-09 10:15:00,QQQ,430.80,429.50,431.90,428.75,429.10,3100000,0.9,430.78,430.82,0.04,17.8,4.1,435,425,432,428,core,webull_browser_manual,FICTIONAL EXAMPLE — not real market data; mid-morning observation template
+2026-07-09 12:00:00,IWM,200.10,,,,,,,,,,,,,,,,,webull_browser_manual,FICTIONAL EXAMPLE — minimal record with all optional fields omitted
+2026-07-09 15:55:00,DIA,392.45,391.00,393.20,390.80,391.30,650000,1.0,392.43,392.47,,,,,,,,core,webull_browser_manual,FICTIONAL EXAMPLE — spread left blank; derived from bid/ask at intake
