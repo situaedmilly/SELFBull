@@ -1,26 +1,28 @@
 """Reusable in-memory MCP session harness.
 
 The harness is intentionally transport-focused and keeps all Webull-specific
-state out of the module boundary. It is designed to run against either a real
-FastMCP server or a fictional FastMCP-like double in offline tests.
+state out of the module boundary. It can run against a fictional FastMCP-like
+test double or against the sealed Webull composition when the caller supplies
+the matching lifecycle adapter.
 """
 
 from __future__ import annotations
 
 import asyncio
 import importlib
-from contextlib import asynccontextmanager, suppress
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import timedelta
 from types import MappingProxyType
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, Callable, Mapping, Optional, Tuple
 
-SCHEMA_VERSION = "004B.mcp-session-harness.v1"
+SCHEMA_VERSION = "004B.mcp-session-harness.v2"
 
 ALLOWED_FAILURE_CLASSES = frozenset(
     {
         "NONE",
         "LIFESPAN_START_FAILED",
+        "SERVER_RESOLUTION_FAILED",
         "CLIENT_SESSION_START_FAILED",
         "CLIENT_INITIALIZATION_FAILED",
         "DISCOVERY_FAILED",
@@ -61,6 +63,13 @@ class MCPSessionReceipt:
     execution_authority: bool
 
 
+@dataclass(frozen=True)
+class MCPLifecycleAdapter:
+    lifespan_context_factory: Callable[[Any], Any]
+    low_level_server_resolver: Callable[[Any], Any]
+    connected_session_factory: Callable[[Any, float], Any]
+
+
 def _blank_receipt() -> MCPSessionReceipt:
     return MCPSessionReceipt(
         schema_version=SCHEMA_VERSION,
@@ -99,23 +108,51 @@ def _seal_receipt(receipt: MCPSessionReceipt) -> MCPSessionReceipt:
     )
 
 
-def _import_runtime_modules() -> Tuple[Any, Any]:
+def _unwrap_server(server: Any) -> Any:
+    return getattr(server, "_server", server)
+
+
+def _default_lifespan_context_factory(server: Any) -> Any:
+    wrapper = _unwrap_server(server)
+    lifespan_manager = getattr(wrapper, "_lifespan_manager", None)
+    if not callable(lifespan_manager):
+        raise TypeError("Server does not expose _lifespan_manager()")
+    return lifespan_manager()
+
+
+def _default_low_level_server_resolver(server: Any) -> Any:
+    wrapper = _unwrap_server(server)
+    low_level_server = getattr(wrapper, "_mcp_server", None)
+    if low_level_server is None:
+        raise TypeError("Server does not expose a low-level MCP server")
+    if not hasattr(low_level_server, "run"):
+        raise TypeError("Low-level server does not expose run()")
+    if not hasattr(low_level_server, "create_initialization_options"):
+        raise TypeError("Low-level server does not expose create_initialization_options()")
+    return low_level_server
+
+
+def _load_runtime_modules() -> tuple[Any, Any]:
     memory_module = importlib.import_module("mcp.shared.memory")
     session_module = importlib.import_module("mcp.client.session")
     return memory_module, session_module
 
 
-def _resolve_server_handles(server: Any) -> Tuple[Any, Any]:
-    lifespan_manager = getattr(server, "_lifespan_manager", None)
-    if not callable(lifespan_manager):
-        raise TypeError("Server does not expose _lifespan_manager()")
+def _default_connected_session_factory(low_level_server: Any, timeout_seconds: float) -> Any:
+    memory_module, _ = _load_runtime_modules()
+    return memory_module.create_connected_server_and_client_session(
+        low_level_server,
+        read_timeout_seconds=timedelta(seconds=timeout_seconds),
+        raise_exceptions=False,
+    )
 
-    low_level_server = getattr(server, "_mcp_server", server)
-    if not hasattr(low_level_server, "run"):
-        raise TypeError("Server does not expose a runnable MCP transport")
-    if not hasattr(low_level_server, "create_initialization_options"):
-        raise TypeError("Server does not expose create_initialization_options()")
-    return lifespan_manager, low_level_server
+
+def _default_lifecycle_adapter() -> MCPLifecycleAdapter:
+    return MCPLifecycleAdapter(
+        lifespan_context_factory=_default_lifespan_context_factory,
+        low_level_server_resolver=_default_low_level_server_resolver,
+        connected_session_factory=_default_connected_session_factory,
+    )
 
 
 def _extract_tool_names(list_tools_result: Any) -> Tuple[str, ...]:
@@ -139,326 +176,229 @@ def _surface_matches(visible: Tuple[str, ...], expected_tool_names: frozenset[st
     return set(visible) == expected_tool_names and len(visible) == len(expected_tool_names)
 
 
+def _leaf_exceptions(exc: BaseException) -> tuple[BaseException, ...]:
+    if _is_exception_group(exc):
+        leaves: list[BaseException] = []
+        for child in getattr(exc, "exceptions", ()):
+            leaves.extend(_leaf_exceptions(child))
+        return tuple(leaves)
+    return (exc,)
+
+
+def _is_exception_group(exc: BaseException) -> bool:
+    return hasattr(exc, "exceptions") and isinstance(getattr(exc, "exceptions"), (list, tuple))
+
+
+def _classify_stage_failure(default_failure_class: str, exc: BaseException | None = None) -> str:
+    if exc is not None:
+        for leaf in _leaf_exceptions(exc):
+            if isinstance(leaf, (TimeoutError, asyncio.TimeoutError)):
+                return "TIMEOUT"
+    if default_failure_class not in ALLOWED_FAILURE_CLASSES:
+        return "UNEXPECTED_ERROR"
+    return default_failure_class
+
+
+def _failure_receipt(
+    *,
+    failure_class: str,
+    invocation_requested: bool,
+    invoked_tool_name: Optional[str],
+    initialized: bool = False,
+    visible_tool_names: Tuple[str, ...] = (),
+    exact_surface_match: bool = False,
+    invocation_completed: bool = False,
+    invocation_result_type: Optional[str] = None,
+    timeout: bool = False,
+    broker_request_count: int = 0,
+) -> MCPSessionReceipt:
+    return _seal_receipt(
+        MCPSessionReceipt(
+            schema_version=SCHEMA_VERSION,
+            initialized=initialized,
+            visible_tool_names=visible_tool_names,
+            exact_surface_match=exact_surface_match,
+            invocation_requested=invocation_requested,
+            invoked_tool_name=invoked_tool_name,
+            invocation_completed=invocation_completed,
+            invocation_result_type=invocation_result_type,
+            timeout=timeout,
+            failure_class=failure_class,
+            client_closed=False,
+            server_closed=False,
+            broker_request_count=broker_request_count,
+            execution_authority=False,
+        )
+    )
+
+
 async def run_in_memory_mcp_session(
     server: Any,
     *,
     expected_tool_names: frozenset[str],
     invocation: Optional[MCPInvocation] = None,
     timeout_seconds: float = 30.0,
+    lifecycle_adapter: Optional[MCPLifecycleAdapter] = None,
 ) -> MCPSessionReceipt:
-    """Run one in-memory MCP session against a FastMCP-like server.
+    """Run one in-memory MCP session against a FastMCP-like server."""
 
-    The function is fail-closed and returns a categorical receipt instead of
-    surfacing raw exceptions.
-    """
-
+    adapter = lifecycle_adapter or _default_lifecycle_adapter()
     expected_tool_names = frozenset(expected_tool_names)
     invocation_requested = invocation is not None
     invoked_tool_name = invocation.tool_name if invocation is not None else None
-    base_receipt = _blank_receipt()
 
     try:
-        lifespan_manager, low_level_server = _resolve_server_handles(server)
-    except Exception:
-        return _seal_receipt(
-            MCPSessionReceipt(
-                schema_version=base_receipt.schema_version,
-                initialized=False,
-                visible_tool_names=(),
-                exact_surface_match=False,
-                invocation_requested=invocation_requested,
-                invoked_tool_name=invoked_tool_name,
-                invocation_completed=False,
-                invocation_result_type=None,
-                timeout=False,
-                failure_class="LIFESPAN_START_FAILED",
-                client_closed=False,
-                server_closed=False,
-                broker_request_count=0,
-                execution_authority=False,
-            )
-        )
-
-    try:
-        memory_module, session_module = _import_runtime_modules()
-    except Exception:
-        return _seal_receipt(
-            MCPSessionReceipt(
-                schema_version=base_receipt.schema_version,
-                initialized=False,
-                visible_tool_names=(),
-                exact_surface_match=False,
-                invocation_requested=invocation_requested,
-                invoked_tool_name=invoked_tool_name,
-                invocation_completed=False,
-                invocation_result_type=None,
-                timeout=False,
-                failure_class="CLIENT_SESSION_START_FAILED",
-                client_closed=False,
-                server_closed=False,
-                broker_request_count=0,
-                execution_authority=False,
-            )
-        )
-
-    server_task: Optional[asyncio.Task[Any]] = None
-
-    try:
-        async with lifespan_manager():
-            async with memory_module.create_client_server_memory_streams() as (
-                client_streams,
-                server_streams,
-            ):
-                client_read, client_write = client_streams
-                server_read, server_write = server_streams
-                server_task = asyncio.create_task(
-                    low_level_server.run(
-                        server_read,
-                        server_write,
-                        low_level_server.create_initialization_options(),
-                        raise_exceptions=False,
-                    )
-                )
-                await asyncio.sleep(0)
-
-                try:
-                    session = session_module.ClientSession(
-                        read_stream=client_read,
-                        write_stream=client_write,
-                        read_timeout_seconds=timedelta(seconds=timeout_seconds),
-                    )
-                except Exception:
-                    return _seal_receipt(
-                        MCPSessionReceipt(
-                            schema_version=base_receipt.schema_version,
-                            initialized=False,
-                            visible_tool_names=(),
-                            exact_surface_match=False,
-                            invocation_requested=invocation_requested,
-                            invoked_tool_name=invoked_tool_name,
-                            invocation_completed=False,
-                            invocation_result_type=None,
-                            timeout=False,
-                            failure_class="CLIENT_SESSION_START_FAILED",
-                            client_closed=False,
-                            server_closed=False,
-                            broker_request_count=0,
-                            execution_authority=False,
-                        )
-                    )
-
-                try:
-                    await session.initialize()
-                except Exception:
-                    return _seal_receipt(
-                        MCPSessionReceipt(
-                            schema_version=base_receipt.schema_version,
-                            initialized=False,
-                            visible_tool_names=(),
-                            exact_surface_match=False,
-                            invocation_requested=invocation_requested,
-                            invoked_tool_name=invoked_tool_name,
-                            invocation_completed=False,
-                            invocation_result_type=None,
-                            timeout=False,
-                            failure_class="CLIENT_INITIALIZATION_FAILED",
-                            client_closed=False,
-                            server_closed=False,
-                            broker_request_count=0,
-                            execution_authority=False,
-                        )
-                    )
-
-                try:
-                    tools_result = await session.list_tools()
-                except Exception:
-                    return _seal_receipt(
-                        MCPSessionReceipt(
-                            schema_version=base_receipt.schema_version,
-                            initialized=True,
-                            visible_tool_names=(),
-                            exact_surface_match=False,
-                            invocation_requested=invocation_requested,
-                            invoked_tool_name=invoked_tool_name,
-                            invocation_completed=False,
-                            invocation_result_type=None,
-                            timeout=False,
-                            failure_class="DISCOVERY_FAILED",
-                            client_closed=False,
-                            server_closed=False,
-                            broker_request_count=0,
-                            execution_authority=False,
-                        )
-                    )
-
-                visible_tool_names = _extract_tool_names(tools_result)
-                exact_surface_match = _surface_matches(visible_tool_names, expected_tool_names)
-
-                if not exact_surface_match:
-                    return _seal_receipt(
-                        MCPSessionReceipt(
-                            schema_version=SCHEMA_VERSION,
-                            initialized=True,
-                            visible_tool_names=visible_tool_names,
-                            exact_surface_match=False,
-                            invocation_requested=invocation_requested,
-                            invoked_tool_name=invoked_tool_name,
-                            invocation_completed=False,
-                            invocation_result_type=None,
-                            timeout=False,
-                            failure_class="SURFACE_MISMATCH",
-                            client_closed=False,
-                            server_closed=False,
-                            broker_request_count=0,
-                            execution_authority=False,
-                        )
-                    )
-
-                if invocation is not None and invocation.tool_name not in expected_tool_names:
-                    return _seal_receipt(
-                        MCPSessionReceipt(
-                            schema_version=SCHEMA_VERSION,
-                            initialized=True,
-                            visible_tool_names=visible_tool_names,
-                            exact_surface_match=True,
-                            invocation_requested=True,
-                            invoked_tool_name=invocation.tool_name,
-                            invocation_completed=False,
-                            invocation_result_type=None,
-                            timeout=False,
-                            failure_class="TOOL_NOT_ALLOWED",
-                            client_closed=False,
-                            server_closed=False,
-                            broker_request_count=0,
-                            execution_authority=False,
-                        )
-                    )
-
-                if invocation is None:
-                    return _seal_receipt(
-                        MCPSessionReceipt(
-                            schema_version=SCHEMA_VERSION,
-                            initialized=True,
-                            visible_tool_names=visible_tool_names,
-                            exact_surface_match=True,
-                            invocation_requested=False,
-                            invoked_tool_name=None,
-                            invocation_completed=False,
-                            invocation_result_type=None,
-                            timeout=False,
-                            failure_class="NONE",
-                            client_closed=False,
-                            server_closed=False,
-                            broker_request_count=0,
-                            execution_authority=False,
-                        )
-                    )
-
-                try:
-                    result = await asyncio.wait_for(
-                        session.call_tool(invocation.tool_name, dict(invocation.arguments)),
-                        timeout=timeout_seconds,
-                    )
-                except asyncio.TimeoutError:
-                    return _seal_receipt(
-                        MCPSessionReceipt(
-                            schema_version=SCHEMA_VERSION,
-                            initialized=True,
-                            visible_tool_names=visible_tool_names,
-                            exact_surface_match=True,
-                            invocation_requested=True,
-                            invoked_tool_name=invocation.tool_name,
-                            invocation_completed=False,
-                            invocation_result_type=None,
-                            timeout=True,
-                            failure_class="TIMEOUT",
-                            client_closed=False,
-                            server_closed=False,
-                            broker_request_count=1,
-                            execution_authority=False,
-                        )
-                    )
-                except Exception:
-                    return _seal_receipt(
-                        MCPSessionReceipt(
-                            schema_version=SCHEMA_VERSION,
-                            initialized=True,
-                            visible_tool_names=visible_tool_names,
-                            exact_surface_match=True,
-                            invocation_requested=True,
-                            invoked_tool_name=invocation.tool_name,
-                            invocation_completed=False,
-                            invocation_result_type=None,
-                            timeout=False,
-                            failure_class="INVOCATION_FAILED",
-                            client_closed=False,
-                            server_closed=False,
-                            broker_request_count=1,
-                            execution_authority=False,
-                        )
-                    )
-                else:
-                    return _seal_receipt(
-                        MCPSessionReceipt(
-                            schema_version=SCHEMA_VERSION,
-                            initialized=True,
-                            visible_tool_names=visible_tool_names,
-                            exact_surface_match=True,
-                            invocation_requested=True,
-                            invoked_tool_name=invocation.tool_name,
-                            invocation_completed=True,
-                            invocation_result_type=type(result).__name__,
-                            timeout=False,
-                            failure_class="NONE",
-                            client_closed=False,
-                            server_closed=False,
-                            broker_request_count=1,
-                            execution_authority=False,
-                        )
-                    )
-    except Exception:
-        return _seal_receipt(
-            MCPSessionReceipt(
-                schema_version=SCHEMA_VERSION,
-                initialized=False,
-                visible_tool_names=(),
-                exact_surface_match=False,
-                invocation_requested=invocation_requested,
-                invoked_tool_name=invoked_tool_name,
-                invocation_completed=False,
-                invocation_result_type=None,
-                timeout=False,
-                failure_class="LIFESPAN_START_FAILED",
-                client_closed=False,
-                server_closed=False,
-                broker_request_count=0,
-                execution_authority=False,
-            )
-        )
-    finally:
-        if server_task is not None:
-            server_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                try:
-                    await asyncio.wait_for(server_task, timeout=max(timeout_seconds, 0.1))
-                except asyncio.TimeoutError:
-                    pass
-
-    return _seal_receipt(
-        MCPSessionReceipt(
-            schema_version=SCHEMA_VERSION,
-            initialized=False,
-            visible_tool_names=(),
-            exact_surface_match=False,
+        lifespan_context = adapter.lifespan_context_factory(server)
+    except BaseException as exc:
+        return _failure_receipt(
+            failure_class=_classify_stage_failure("LIFESPAN_START_FAILED", exc),
             invocation_requested=invocation_requested,
             invoked_tool_name=invoked_tool_name,
-            invocation_completed=False,
-            invocation_result_type=None,
-            timeout=False,
-            failure_class="UNEXPECTED_ERROR",
-            client_closed=False,
-            server_closed=False,
-            broker_request_count=0,
-            execution_authority=False,
         )
+
+    lifespan_entered = False
+    try:
+        async with lifespan_context:
+            lifespan_entered = True
+
+            try:
+                low_level_server = adapter.low_level_server_resolver(server)
+            except BaseException as exc:
+                return _failure_receipt(
+                    failure_class=_classify_stage_failure("SERVER_RESOLUTION_FAILED", exc),
+                    invocation_requested=invocation_requested,
+                    invoked_tool_name=invoked_tool_name,
+                )
+
+            try:
+                session_context = adapter.connected_session_factory(low_level_server, timeout_seconds)
+            except BaseException as exc:
+                return _failure_receipt(
+                    failure_class=_classify_stage_failure("CLIENT_SESSION_START_FAILED", exc),
+                    invocation_requested=invocation_requested,
+                    invoked_tool_name=invoked_tool_name,
+                )
+
+            session_entered = False
+            try:
+                async with session_context as session:
+                    session_entered = True
+
+                    try:
+                        await session.initialize()
+                    except BaseException as exc:
+                        return _failure_receipt(
+                            failure_class=_classify_stage_failure("CLIENT_INITIALIZATION_FAILED", exc),
+                            invocation_requested=invocation_requested,
+                            invoked_tool_name=invoked_tool_name,
+                        )
+
+                    try:
+                        tools_result = await session.list_tools()
+                    except BaseException as exc:
+                        return _failure_receipt(
+                            failure_class=_classify_stage_failure("DISCOVERY_FAILED", exc),
+                            invocation_requested=invocation_requested,
+                            invoked_tool_name=invoked_tool_name,
+                            initialized=True,
+                        )
+
+                    try:
+                        visible_tool_names = _extract_tool_names(tools_result)
+                    except BaseException as exc:
+                        return _failure_receipt(
+                            failure_class=_classify_stage_failure("DISCOVERY_FAILED", exc),
+                            invocation_requested=invocation_requested,
+                            invoked_tool_name=invoked_tool_name,
+                            initialized=True,
+                        )
+
+                    exact_surface_match = _surface_matches(visible_tool_names, expected_tool_names)
+                    if not exact_surface_match:
+                        return _failure_receipt(
+                            failure_class="SURFACE_MISMATCH",
+                            invocation_requested=invocation_requested,
+                            invoked_tool_name=invoked_tool_name,
+                            initialized=True,
+                            visible_tool_names=visible_tool_names,
+                            exact_surface_match=False,
+                        )
+
+                    if invocation is not None and invocation.tool_name not in expected_tool_names:
+                        return _failure_receipt(
+                            failure_class="TOOL_NOT_ALLOWED",
+                            invocation_requested=True,
+                            invoked_tool_name=invocation.tool_name,
+                            initialized=True,
+                            visible_tool_names=visible_tool_names,
+                            exact_surface_match=True,
+                        )
+
+                    if invocation is None:
+                        return _failure_receipt(
+                            failure_class="NONE",
+                            invocation_requested=False,
+                            invoked_tool_name=None,
+                            initialized=True,
+                            visible_tool_names=visible_tool_names,
+                            exact_surface_match=True,
+                        )
+
+                    try:
+                        result = await asyncio.wait_for(
+                            session.call_tool(invocation.tool_name, dict(invocation.arguments)),
+                            timeout=timeout_seconds,
+                        )
+                    except asyncio.TimeoutError as exc:
+                        return _failure_receipt(
+                            failure_class=_classify_stage_failure("TIMEOUT", exc),
+                            invocation_requested=True,
+                            invoked_tool_name=invocation.tool_name,
+                            initialized=True,
+                            visible_tool_names=visible_tool_names,
+                            exact_surface_match=True,
+                            timeout=True,
+                            broker_request_count=1,
+                        )
+                    except BaseException as exc:
+                        return _failure_receipt(
+                            failure_class=_classify_stage_failure("INVOCATION_FAILED", exc),
+                            invocation_requested=True,
+                            invoked_tool_name=invocation.tool_name,
+                            initialized=True,
+                            visible_tool_names=visible_tool_names,
+                            exact_surface_match=True,
+                            broker_request_count=1,
+                        )
+
+                    return _failure_receipt(
+                        failure_class="NONE",
+                        invocation_requested=True,
+                        invoked_tool_name=invocation.tool_name,
+                        initialized=True,
+                        visible_tool_names=visible_tool_names,
+                        exact_surface_match=True,
+                        invocation_completed=True,
+                        invocation_result_type=type(result).__name__,
+                        broker_request_count=1,
+                    )
+            except BaseException as exc:
+                failure_class = "SHUTDOWN_FAILED" if session_entered else "CLIENT_SESSION_START_FAILED"
+                return _failure_receipt(
+                    failure_class=_classify_stage_failure(failure_class, exc),
+                    invocation_requested=invocation_requested,
+                    invoked_tool_name=invoked_tool_name,
+                )
+    except BaseException as exc:
+        failure_class = "SHUTDOWN_FAILED" if lifespan_entered else "LIFESPAN_START_FAILED"
+        return _failure_receipt(
+            failure_class=_classify_stage_failure(failure_class, exc),
+            invocation_requested=invocation_requested,
+            invoked_tool_name=invoked_tool_name,
+        )
+
+    return _failure_receipt(
+        failure_class="UNEXPECTED_ERROR",
+        invocation_requested=invocation_requested,
+        invoked_tool_name=invoked_tool_name,
     )

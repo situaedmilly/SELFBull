@@ -6,166 +6,199 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Optional
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from selfbull import mcp_session_harness as harness
-from selfbull.mcp_session_harness import MCPInvocation, MCPSessionReceipt, run_in_memory_mcp_session
+from selfbull.mcp_session_harness import (  # noqa: E402
+    MCPInvocation,
+    MCPLifecycleAdapter,
+    MCPSessionReceipt,
+    run_in_memory_mcp_session,
+)
 
 
 @dataclass
 class SessionScenario:
     visible_tool_names: list[str] = field(default_factory=lambda: ["fictional_snapshot"])
-    hidden_tool_names: list[str] = field(default_factory=lambda: ["fictional_mutation"])
-    initialize_error: Optional[Exception] = None
-    discovery_error: Optional[Exception] = None
-    invocation_error: Optional[Exception] = None
+    initialize_error: Optional[BaseException] = None
+    discovery_error: Optional[BaseException] = None
+    invocation_error: Optional[BaseException] = None
+    lifespan_error: Optional[BaseException] = None
+    lifespan_exit_error: Optional[BaseException] = None
+    session_factory_error: Optional[BaseException] = None
+    session_enter_error: Optional[BaseException] = None
+    session_exit_error: Optional[BaseException] = None
     call_delay: float = 0.0
-    lifespan_error: Optional[Exception] = None
-    extra_tool_schema: dict[str, dict[str, object]] = field(default_factory=dict)
+    events: list[str] = field(default_factory=list)
+    received_low_level_server: object | None = None
+    low_level_resolved: bool = False
+
+
+class SyntheticExceptionGroup(RuntimeError):
+    def __init__(self, message: str, exceptions: list[BaseException]) -> None:
+        super().__init__(message)
+        self.exceptions = exceptions
 
 
 class FakeLowLevelServer:
     def __init__(self, scenario: SessionScenario) -> None:
         self.scenario = scenario
-        self.run_calls = 0
-        self.init_options_calls = 0
-        self.started = False
-        self.stopped = False
+        self.create_initialization_options_calls = 0
 
     def create_initialization_options(self) -> object:
-        self.init_options_calls += 1
+        self.create_initialization_options_calls += 1
         return object()
 
-    async def run(self, read_stream, write_stream, initialization_options, raise_exceptions=False, stateless=False) -> None:
-        self.run_calls += 1
-        self.started = True
-        try:
-            await asyncio.Event().wait()
-        finally:
-            self.stopped = True
+    async def run(self, *args, **kwargs) -> None:  # pragma: no cover - kept as a shape witness
+        await asyncio.sleep(0)
 
 
-class FakeClientSession:
-    def __init__(self, scenario: SessionScenario, *args, **kwargs) -> None:
-        self.scenario = scenario
-        self.args = args
-        self.kwargs = kwargs
-        self.initialize_calls = 0
-        self.list_tools_calls = 0
-        self.call_tool_calls = 0
-
-    async def initialize(self):
-        self.initialize_calls += 1
-        if self.scenario.initialize_error is not None:
-            raise self.scenario.initialize_error
-        return SimpleNamespace(protocolVersion="2024-11-05")
-
-    async def list_tools(self, cursor=None, *, params=None):
-        self.list_tools_calls += 1
-        if self.scenario.discovery_error is not None:
-            raise self.scenario.discovery_error
-        tool_names = list(self.scenario.visible_tool_names)
-        tools = []
-        for name in tool_names:
-            tools.append(
-                SimpleNamespace(
-                    name=name,
-                    inputSchema=self.scenario.extra_tool_schema.get(
-                        name,
-                        {"properties": {"symbol": {"type": "string"}}, "required": ["symbol"]},
-                    ),
-                )
-            )
-        return SimpleNamespace(tools=tools)
-
-    async def call_tool(self, name, arguments=None, read_timeout_seconds=None, progress_callback=None, *, meta=None):
-        self.call_tool_calls += 1
-        if self.scenario.invocation_error is not None:
-            raise self.scenario.invocation_error
-        if self.scenario.call_delay:
-            await asyncio.sleep(self.scenario.call_delay)
-        payload = {
-            "tool": name,
-            "arguments": dict(arguments or {}),
-            "symbol": (arguments or {}).get("symbol") or (arguments or {}).get("symbols"),
-            "result": "fictional_snapshot",
-        }
-        return payload
-
-
-class FakeMemoryTransport:
+class FakeLifespanContext:
     def __init__(self, scenario: SessionScenario) -> None:
         self.scenario = scenario
         self.entered = 0
         self.exited = 0
 
-    @asynccontextmanager
-    async def create_client_server_memory_streams(self):
+    async def __aenter__(self):
         self.entered += 1
-        client_streams = (SimpleNamespace(name="client_read"), SimpleNamespace(name="client_write"))
-        server_streams = (SimpleNamespace(name="server_read"), SimpleNamespace(name="server_write"))
-        try:
-            yield client_streams, server_streams
-        finally:
-            self.exited += 1
+        self.scenario.events.append("lifespan_enter")
+        if self.scenario.lifespan_error is not None:
+            raise self.scenario.lifespan_error
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.exited += 1
+        self.scenario.events.append("lifespan_exit")
+        if self.scenario.lifespan_exit_error is not None:
+            raise self.scenario.lifespan_exit_error
+        return False
 
 
-class FakeServer:
+class FakeHighLevelServer:
     def __init__(self, scenario: SessionScenario) -> None:
         self.scenario = scenario
         self._mcp_server = FakeLowLevelServer(scenario)
-        self.lifespan_entered = 0
-        self.lifespan_exited = 0
+        self._lifespan = FakeLifespanContext(scenario)
 
-    @asynccontextmanager
-    async def _lifespan_manager(self):
-        self.lifespan_entered += 1
-        try:
-            if self.scenario.lifespan_error is not None:
-                raise self.scenario.lifespan_error
-            yield
-        finally:
-            self.lifespan_exited += 1
+    def _lifespan_manager(self):
+        return self._lifespan
 
 
-def _fake_import_module_factory(scenario: SessionScenario, transport: FakeMemoryTransport):
-    fake_memory_module = ModuleType("mcp.shared.memory")
-    fake_memory_module.create_client_server_memory_streams = transport.create_client_server_memory_streams
+class FakeClientSession:
+    def __init__(self, scenario: SessionScenario, low_level_server: object) -> None:
+        self.scenario = scenario
+        self.low_level_server = low_level_server
+        self.initialize_calls = 0
+        self.list_tools_calls = 0
+        self.call_tool_calls = 0
+        self.closed = False
 
-    fake_session_module = ModuleType("mcp.client.session")
-    fake_session_module.ClientSession = lambda *args, **kwargs: FakeClientSession(scenario, *args, **kwargs)
+    async def initialize(self):
+        self.initialize_calls += 1
+        self.scenario.events.append("initialize")
+        if self.scenario.initialize_error is not None:
+            raise self.scenario.initialize_error
+        return SimpleNamespace(protocolVersion="fictional")
 
-    def fake_import_module(name: str, package: Optional[str] = None):
-        if name == "mcp.shared.memory":
-            return fake_memory_module
-        if name == "mcp.client.session":
-            return fake_session_module
-        return __import__(name, fromlist=["*"])
+    async def list_tools(self, cursor=None, *, params=None):
+        self.list_tools_calls += 1
+        self.scenario.events.append("list_tools")
+        if self.scenario.discovery_error is not None:
+            raise self.scenario.discovery_error
+        tools = [SimpleNamespace(name=name) for name in self.scenario.visible_tool_names]
+        return SimpleNamespace(tools=tools)
 
-    return fake_import_module
+    async def call_tool(self, name, arguments=None, read_timeout_seconds=None, progress_callback=None, *, meta=None):
+        self.call_tool_calls += 1
+        self.scenario.events.append("call_tool")
+        if self.scenario.invocation_error is not None:
+            raise self.scenario.invocation_error
+        if self.scenario.call_delay:
+            await asyncio.sleep(self.scenario.call_delay)
+        return {
+            "tool": name,
+            "arguments": dict(arguments or {}),
+            "result": "fictional_snapshot",
+        }
+
+
+class FakeSessionContext:
+    def __init__(self, scenario: SessionScenario, low_level_server: object) -> None:
+        self.scenario = scenario
+        self.low_level_server = low_level_server
+        self.client = FakeClientSession(scenario, low_level_server)
+        self.entered = 0
+        self.exited = 0
+
+    async def __aenter__(self):
+        self.entered += 1
+        self.scenario.events.append("session_enter")
+        if self.scenario.session_enter_error is not None:
+            raise self.scenario.session_enter_error
+        return self.client
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.exited += 1
+        self.scenario.events.append("session_exit")
+        self.client.closed = True
+        if self.scenario.session_exit_error is not None:
+            raise self.scenario.session_exit_error
+        return False
+
+
+def _make_adapter(scenario: SessionScenario, server: FakeHighLevelServer) -> MCPLifecycleAdapter:
+    def lifespan_context_factory(seen_server: object):
+        assert seen_server is server
+        return server._lifespan_manager()
+
+    def low_level_server_resolver(seen_server: object):
+        assert seen_server is server
+        scenario.low_level_resolved = True
+        scenario.events.append("resolve_low_level")
+        return server._mcp_server
+
+    def connected_session_factory(low_level_server: object, timeout_seconds: float):
+        scenario.received_low_level_server = low_level_server
+        scenario.events.append("connected_session_factory")
+        if low_level_server is not server._mcp_server:
+            raise AssertionError("connected_session_factory received the wrong server")
+        if scenario.session_factory_error is not None:
+            raise scenario.session_factory_error
+
+        @asynccontextmanager
+        async def _session_context():
+            context = FakeSessionContext(scenario, low_level_server)
+            async with context as client:
+                yield client
+
+        return _session_context()
+
+    return MCPLifecycleAdapter(
+        lifespan_context_factory=lifespan_context_factory,
+        low_level_server_resolver=low_level_server_resolver,
+        connected_session_factory=connected_session_factory,
+    )
 
 
 class TestMCPSessionHarness(IsolatedAsyncioTestCase):
     async def test_fictional_harness_runs_successfully_offline(self):
         scenario = SessionScenario()
-        transport = FakeMemoryTransport(scenario)
-        server = FakeServer(scenario)
+        server = FakeHighLevelServer(scenario)
+        adapter = _make_adapter(scenario, server)
 
-        with patch.object(harness.importlib, "import_module", side_effect=_fake_import_module_factory(scenario, transport)):
-            receipt = await run_in_memory_mcp_session(
-                server,
-                expected_tool_names=frozenset({"fictional_snapshot"}),
-                invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
-                timeout_seconds=1.0,
-            )
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"fictional_snapshot"}),
+            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            timeout_seconds=1.0,
+            lifecycle_adapter=adapter,
+        )
 
         self.assertIsInstance(receipt, MCPSessionReceipt)
-        self.assertEqual(receipt.schema_version, "004B.mcp-session-harness.v1")
+        self.assertEqual(receipt.schema_version, "004B.mcp-session-harness.v2")
         self.assertTrue(receipt.initialized)
         self.assertEqual(receipt.visible_tool_names, ("fictional_snapshot",))
         self.assertTrue(receipt.exact_surface_match)
@@ -179,50 +212,62 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         self.assertTrue(receipt.server_closed)
         self.assertEqual(receipt.broker_request_count, 1)
         self.assertFalse(receipt.execution_authority)
-        self.assertEqual(transport.entered, 1)
-        self.assertEqual(transport.exited, 1)
-        self.assertEqual(server.lifespan_entered, 1)
-        self.assertEqual(server.lifespan_exited, 1)
-        self.assertEqual(server._mcp_server.run_calls, 1)
-        self.assertEqual(server._mcp_server.init_options_calls, 1)
-
-        pending = [task for task in asyncio.all_tasks() if task is not asyncio.current_task() and not task.done()]
-        self.assertEqual(pending, [])
+        self.assertEqual(scenario.events, [
+            "lifespan_enter",
+            "resolve_low_level",
+            "connected_session_factory",
+            "session_enter",
+            "initialize",
+            "list_tools",
+            "call_tool",
+            "session_exit",
+            "lifespan_exit",
+        ])
+        self.assertIs(scenario.received_low_level_server, server._mcp_server)
+        self.assertTrue(scenario.low_level_resolved)
 
     async def test_forbidden_invocation_is_refused_before_handler_lookup(self):
         scenario = SessionScenario()
-        transport = FakeMemoryTransport(scenario)
-        server = FakeServer(scenario)
+        server = FakeHighLevelServer(scenario)
+        adapter = _make_adapter(scenario, server)
 
-        with patch.object(harness.importlib, "import_module", side_effect=_fake_import_module_factory(scenario, transport)):
-            receipt = await run_in_memory_mcp_session(
-                server,
-                expected_tool_names=frozenset({"fictional_snapshot"}),
-                invocation=MCPInvocation("fictional_mutation", {"name": "Tech Stocks"}),
-                timeout_seconds=1.0,
-            )
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"fictional_snapshot"}),
+            invocation=MCPInvocation("fictional_mutation", {"name": "Tech Stocks"}),
+            timeout_seconds=1.0,
+            lifecycle_adapter=adapter,
+        )
 
         self.assertEqual(receipt.failure_class, "TOOL_NOT_ALLOWED")
         self.assertTrue(receipt.invocation_requested)
         self.assertEqual(receipt.invoked_tool_name, "fictional_mutation")
         self.assertFalse(receipt.invocation_completed)
         self.assertEqual(receipt.broker_request_count, 0)
-        self.assertEqual(server._mcp_server.run_calls, 1)
-        self.assertEqual(transport.entered, 1)
-        self.assertEqual(transport.exited, 1)
+        self.assertEqual(scenario.events, [
+            "lifespan_enter",
+            "resolve_low_level",
+            "connected_session_factory",
+            "session_enter",
+            "initialize",
+            "list_tools",
+            "session_exit",
+            "lifespan_exit",
+        ])
+        self.assertEqual(server._mcp_server.create_initialization_options_calls, 0)
 
     async def test_surface_mismatch_blocks_invocation(self):
         scenario = SessionScenario(visible_tool_names=["fictional_snapshot", "fictional_mutation"])
-        transport = FakeMemoryTransport(scenario)
-        server = FakeServer(scenario)
+        server = FakeHighLevelServer(scenario)
+        adapter = _make_adapter(scenario, server)
 
-        with patch.object(harness.importlib, "import_module", side_effect=_fake_import_module_factory(scenario, transport)):
-            receipt = await run_in_memory_mcp_session(
-                server,
-                expected_tool_names=frozenset({"fictional_snapshot"}),
-                invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
-                timeout_seconds=1.0,
-            )
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"fictional_snapshot"}),
+            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            timeout_seconds=1.0,
+            lifecycle_adapter=adapter,
+        )
 
         self.assertEqual(receipt.failure_class, "SURFACE_MISMATCH")
         self.assertFalse(receipt.invocation_completed)
@@ -230,19 +275,20 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         self.assertEqual(receipt.visible_tool_names, ("fictional_mutation", "fictional_snapshot"))
         self.assertTrue(receipt.client_closed)
         self.assertTrue(receipt.server_closed)
+        self.assertNotIn("call_tool", scenario.events)
 
     async def test_timeout_becomes_controlled(self):
         scenario = SessionScenario(call_delay=0.1)
-        transport = FakeMemoryTransport(scenario)
-        server = FakeServer(scenario)
+        server = FakeHighLevelServer(scenario)
+        adapter = _make_adapter(scenario, server)
 
-        with patch.object(harness.importlib, "import_module", side_effect=_fake_import_module_factory(scenario, transport)):
-            receipt = await run_in_memory_mcp_session(
-                server,
-                expected_tool_names=frozenset({"fictional_snapshot"}),
-                invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
-                timeout_seconds=0.001,
-            )
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"fictional_snapshot"}),
+            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            timeout_seconds=0.001,
+            lifecycle_adapter=adapter,
+        )
 
         self.assertEqual(receipt.failure_class, "TIMEOUT")
         self.assertTrue(receipt.timeout)
@@ -253,16 +299,16 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
 
     async def test_tool_exception_becomes_controlled(self):
         scenario = SessionScenario(invocation_error=ValueError("boom"))
-        transport = FakeMemoryTransport(scenario)
-        server = FakeServer(scenario)
+        server = FakeHighLevelServer(scenario)
+        adapter = _make_adapter(scenario, server)
 
-        with patch.object(harness.importlib, "import_module", side_effect=_fake_import_module_factory(scenario, transport)):
-            receipt = await run_in_memory_mcp_session(
-                server,
-                expected_tool_names=frozenset({"fictional_snapshot"}),
-                invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
-                timeout_seconds=1.0,
-            )
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"fictional_snapshot"}),
+            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            timeout_seconds=1.0,
+            lifecycle_adapter=adapter,
+        )
 
         self.assertEqual(receipt.failure_class, "INVOCATION_FAILED")
         self.assertFalse(receipt.invocation_completed)
@@ -272,16 +318,16 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
 
     async def test_initialization_failure_becomes_controlled(self):
         scenario = SessionScenario(initialize_error=RuntimeError("init failed"))
-        transport = FakeMemoryTransport(scenario)
-        server = FakeServer(scenario)
+        server = FakeHighLevelServer(scenario)
+        adapter = _make_adapter(scenario, server)
 
-        with patch.object(harness.importlib, "import_module", side_effect=_fake_import_module_factory(scenario, transport)):
-            receipt = await run_in_memory_mcp_session(
-                server,
-                expected_tool_names=frozenset({"fictional_snapshot"}),
-                invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
-                timeout_seconds=1.0,
-            )
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"fictional_snapshot"}),
+            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            timeout_seconds=1.0,
+            lifecycle_adapter=adapter,
+        )
 
         self.assertEqual(receipt.failure_class, "CLIENT_INITIALIZATION_FAILED")
         self.assertFalse(receipt.initialized)
@@ -289,41 +335,133 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         self.assertTrue(receipt.server_closed)
         self.assertEqual(receipt.broker_request_count, 0)
 
+    async def test_exception_group_is_classified_stably(self):
+        scenario = SessionScenario(initialize_error=SyntheticExceptionGroup("init", [RuntimeError("boom")]))
+        server = FakeHighLevelServer(scenario)
+        adapter = _make_adapter(scenario, server)
+
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"fictional_snapshot"}),
+            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            timeout_seconds=1.0,
+            lifecycle_adapter=adapter,
+        )
+
+        self.assertEqual(receipt.failure_class, "CLIENT_INITIALIZATION_FAILED")
+        self.assertTrue(receipt.client_closed)
+        self.assertTrue(receipt.server_closed)
+
     async def test_lifespan_failure_becomes_controlled(self):
         scenario = SessionScenario(lifespan_error=RuntimeError("lifespan failed"))
-        transport = FakeMemoryTransport(scenario)
-        server = FakeServer(scenario)
+        server = FakeHighLevelServer(scenario)
+        adapter = _make_adapter(scenario, server)
 
-        with patch.object(harness.importlib, "import_module", side_effect=_fake_import_module_factory(scenario, transport)):
-            receipt = await run_in_memory_mcp_session(
-                server,
-                expected_tool_names=frozenset({"fictional_snapshot"}),
-                invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
-                timeout_seconds=1.0,
-            )
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"fictional_snapshot"}),
+            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            timeout_seconds=1.0,
+            lifecycle_adapter=adapter,
+        )
 
         self.assertEqual(receipt.failure_class, "LIFESPAN_START_FAILED")
         self.assertFalse(receipt.initialized)
         self.assertTrue(receipt.client_closed)
         self.assertTrue(receipt.server_closed)
-        self.assertEqual(server.lifespan_entered, 1)
-        self.assertEqual(server.lifespan_exited, 1)
+        self.assertEqual(server._lifespan.entered, 1)
+        self.assertEqual(server._lifespan.exited, 0)
+        self.assertEqual(scenario.events, ["lifespan_enter"])
+
+    async def test_lifespan_shutdown_failure_is_controlled(self):
+        scenario = SessionScenario(lifespan_exit_error=RuntimeError("lifespan shutdown failed"))
+        server = FakeHighLevelServer(scenario)
+        adapter = _make_adapter(scenario, server)
+
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"fictional_snapshot"}),
+            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            timeout_seconds=1.0,
+            lifecycle_adapter=adapter,
+        )
+
+        self.assertEqual(receipt.failure_class, "SHUTDOWN_FAILED")
+        self.assertTrue(receipt.client_closed)
+        self.assertTrue(receipt.server_closed)
+        self.assertEqual(server._lifespan.entered, 1)
+        self.assertEqual(server._lifespan.exited, 1)
+        self.assertEqual(scenario.events[-2:], ["session_exit", "lifespan_exit"])
+
+    async def test_low_level_resolution_failure_becomes_controlled(self):
+        scenario = SessionScenario()
+        server = FakeHighLevelServer(scenario)
+
+        def lifespan_context_factory(seen_server: object):
+            assert seen_server is server
+            return server._lifespan_manager()
+
+        def low_level_server_resolver(seen_server: object):
+            assert seen_server is server
+            raise RuntimeError("no low-level server")
+
+        def connected_session_factory(low_level_server: object, timeout_seconds: float):
+            raise AssertionError("should not be reached")
+
+        adapter = MCPLifecycleAdapter(
+            lifespan_context_factory=lifespan_context_factory,
+            low_level_server_resolver=low_level_server_resolver,
+            connected_session_factory=connected_session_factory,
+        )
+
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"fictional_snapshot"}),
+            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            timeout_seconds=1.0,
+            lifecycle_adapter=adapter,
+        )
+
+        self.assertEqual(receipt.failure_class, "SERVER_RESOLUTION_FAILED")
+        self.assertTrue(receipt.client_closed)
+        self.assertTrue(receipt.server_closed)
+
+    async def test_shutdown_failure_is_controlled(self):
+        scenario = SessionScenario(session_exit_error=RuntimeError("shutdown failed"))
+        server = FakeHighLevelServer(scenario)
+        adapter = _make_adapter(scenario, server)
+
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"fictional_snapshot"}),
+            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            timeout_seconds=1.0,
+            lifecycle_adapter=adapter,
+        )
+
+        self.assertEqual(receipt.failure_class, "SHUTDOWN_FAILED")
+        self.assertTrue(receipt.client_closed)
+        self.assertTrue(receipt.server_closed)
 
     async def test_repeated_use_does_not_leak_tasks(self):
         for _ in range(2):
             scenario = SessionScenario()
-            transport = FakeMemoryTransport(scenario)
-            server = FakeServer(scenario)
-            with patch.object(harness.importlib, "import_module", side_effect=_fake_import_module_factory(scenario, transport)):
-                receipt = await run_in_memory_mcp_session(
-                    server,
-                    expected_tool_names=frozenset({"fictional_snapshot"}),
-                    invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
-                    timeout_seconds=1.0,
-                )
+            server = FakeHighLevelServer(scenario)
+            adapter = _make_adapter(scenario, server)
+            receipt = await run_in_memory_mcp_session(
+                server,
+                expected_tool_names=frozenset({"fictional_snapshot"}),
+                invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+                timeout_seconds=1.0,
+                lifecycle_adapter=adapter,
+            )
             self.assertEqual(receipt.failure_class, "NONE")
             self.assertEqual(receipt.broker_request_count, 1)
-            pending = [task for task in asyncio.all_tasks() if task is not asyncio.current_task() and not task.done()]
+            pending = [
+                task
+                for task in asyncio.all_tasks()
+                if task is not asyncio.current_task() and not task.done()
+            ]
             self.assertEqual(pending, [])
 
     def test_invocation_arguments_are_immutable(self):
@@ -333,7 +471,7 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
 
     def test_receipt_is_value_free_and_immutable(self):
         receipt = MCPSessionReceipt(
-            schema_version="004B.mcp-session-harness.v1",
+            schema_version="004B.mcp-session-harness.v2",
             initialized=True,
             visible_tool_names=("fictional_snapshot",),
             exact_surface_match=True,
