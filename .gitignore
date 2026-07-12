@@ -10,3 +10,4 @@ logs/
 .DS_Store
 # Live manual-observation store stays local; only data/examples/ is committed.
 data/*.jsonl
+.venv/
