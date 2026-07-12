@@ -29,6 +29,7 @@ ALLOWED_FAILURE_CLASSES = frozenset(
         "SURFACE_MISMATCH",
         "TOOL_NOT_ALLOWED",
         "INVOCATION_FAILED",
+        "SCHEMA_ADMISSION_FAILED",
         "TIMEOUT",
         "SHUTDOWN_FAILED",
         "UNEXPECTED_ERROR",
@@ -172,6 +173,66 @@ def _extract_tool_names(list_tools_result: Any) -> Tuple[str, ...]:
     return tuple(sorted(names))
 
 
+def _extract_tool_descriptors(list_tools_result: Any) -> dict[str, Any]:
+    """Return the discovered tool descriptors without retaining raw values."""
+
+    tools = getattr(list_tools_result, "tools", list_tools_result)
+    if tools is None:
+        return {}
+
+    descriptors: dict[str, Any] = {}
+    for tool in tools:
+        name = getattr(tool, "name", None)
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Malformed tool inventory")
+        normalized = name.strip()
+        if normalized in descriptors:
+            raise ValueError("Duplicate tool names detected")
+        descriptors[normalized] = tool
+    return descriptors
+
+
+class _SchemaAdmissionError(ValueError):
+    """Value-free internal refusal for an unsupported invocation contract."""
+
+
+def _admit_invocation_arguments(tool: Any, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Admit only the exact single-symbol-to-symbols-array contract."""
+
+    schema = getattr(tool, "inputSchema", None)
+    if schema is None:
+        schema = getattr(tool, "input_schema", None)
+    if not isinstance(schema, Mapping) or schema.get("type") != "object":
+        raise _SchemaAdmissionError("unsupported schema")
+
+    properties = schema.get("properties")
+    if not isinstance(properties, Mapping) or set(properties) != {"symbols"}:
+        raise _SchemaAdmissionError("unsupported properties")
+
+    symbols_schema = properties.get("symbols")
+    if not isinstance(symbols_schema, Mapping) or symbols_schema.get("type") != "array":
+        raise _SchemaAdmissionError("unsupported symbols schema")
+    items_schema = symbols_schema.get("items")
+    if not isinstance(items_schema, Mapping) or items_schema.get("type") != "string":
+        raise _SchemaAdmissionError("unsupported symbols items")
+
+    required = schema.get("required")
+    if not isinstance(required, (list, tuple)) or not all(
+        isinstance(name, str) for name in required
+    ):
+        raise _SchemaAdmissionError("unsupported required fields")
+    if set(required) != {"symbols"}:
+        raise _SchemaAdmissionError("unsupported required fields")
+
+    if not isinstance(arguments, Mapping) or set(arguments) != {"symbol"}:
+        raise _SchemaAdmissionError("unsupported canonical arguments")
+    symbol = arguments.get("symbol")
+    if not isinstance(symbol, str) or not symbol.strip():
+        raise _SchemaAdmissionError("invalid canonical symbol")
+
+    return {"symbols": [symbol]}
+
+
 def _surface_matches(visible: Tuple[str, ...], expected_tool_names: frozenset[str]) -> bool:
     return set(visible) == expected_tool_names and len(visible) == len(expected_tool_names)
 
@@ -304,7 +365,8 @@ async def run_in_memory_mcp_session(
                         )
 
                     try:
-                        visible_tool_names = _extract_tool_names(tools_result)
+                        tool_descriptors = _extract_tool_descriptors(tools_result)
+                        visible_tool_names = tuple(sorted(tool_descriptors))
                     except BaseException as exc:
                         return _failure_receipt(
                             failure_class=_classify_stage_failure("DISCOVERY_FAILED", exc),
@@ -345,8 +407,22 @@ async def run_in_memory_mcp_session(
                         )
 
                     try:
+                        admitted_arguments = _admit_invocation_arguments(
+                            tool_descriptors[invocation.tool_name], invocation.arguments
+                        )
+                    except _SchemaAdmissionError:
+                        return _failure_receipt(
+                            failure_class="SCHEMA_ADMISSION_FAILED",
+                            invocation_requested=True,
+                            invoked_tool_name=invocation.tool_name,
+                            initialized=True,
+                            visible_tool_names=visible_tool_names,
+                            exact_surface_match=True,
+                        )
+
+                    try:
                         result = await asyncio.wait_for(
-                            session.call_tool(invocation.tool_name, dict(invocation.arguments)),
+                            session.call_tool(invocation.tool_name, admitted_arguments),
                             timeout=timeout_seconds,
                         )
                     except asyncio.TimeoutError as exc:

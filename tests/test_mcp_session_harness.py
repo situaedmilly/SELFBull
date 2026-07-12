@@ -23,6 +23,17 @@ from selfbull.mcp_session_harness import (  # noqa: E402
 @dataclass
 class SessionScenario:
     visible_tool_names: list[str] = field(default_factory=lambda: ["fictional_snapshot"])
+    tool_schemas: dict[str, dict | None] = field(
+        default_factory=lambda: {
+            "fictional_snapshot": {
+                "type": "object",
+                "properties": {
+                    "symbols": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["symbols"],
+            }
+        }
+    )
     initialize_error: Optional[BaseException] = None
     discovery_error: Optional[BaseException] = None
     invocation_error: Optional[BaseException] = None
@@ -33,6 +44,8 @@ class SessionScenario:
     session_exit_error: Optional[BaseException] = None
     call_delay: float = 0.0
     events: list[str] = field(default_factory=list)
+    call_tool_calls: int = 0
+    call_tool_arguments: list[dict] = field(default_factory=list)
     received_low_level_server: object | None = None
     low_level_resolved: bool = False
 
@@ -108,11 +121,16 @@ class FakeClientSession:
         self.scenario.events.append("list_tools")
         if self.scenario.discovery_error is not None:
             raise self.scenario.discovery_error
-        tools = [SimpleNamespace(name=name) for name in self.scenario.visible_tool_names]
+        tools = [
+            SimpleNamespace(name=name, inputSchema=self.scenario.tool_schemas.get(name))
+            for name in self.scenario.visible_tool_names
+        ]
         return SimpleNamespace(tools=tools)
 
     async def call_tool(self, name, arguments=None, read_timeout_seconds=None, progress_callback=None, *, meta=None):
         self.call_tool_calls += 1
+        self.scenario.call_tool_calls += 1
+        self.scenario.call_tool_arguments.append(dict(arguments or {}))
         self.scenario.events.append("call_tool")
         if self.scenario.invocation_error is not None:
             raise self.scenario.invocation_error
@@ -184,6 +202,21 @@ def _make_adapter(scenario: SessionScenario, server: FakeHighLevelServer) -> MCP
 
 
 class TestMCPSessionHarness(IsolatedAsyncioTestCase):
+    async def _run_schema_case(self, schema, arguments):
+        scenario = SessionScenario(
+            visible_tool_names=["get_stock_snapshot"],
+            tool_schemas={"get_stock_snapshot": schema},
+        )
+        server = FakeHighLevelServer(scenario)
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"get_stock_snapshot"}),
+            invocation=MCPInvocation("get_stock_snapshot", arguments),
+            timeout_seconds=1.0,
+            lifecycle_adapter=_make_adapter(scenario, server),
+        )
+        return receipt, scenario
+
     async def test_fictional_harness_runs_successfully_offline(self):
         scenario = SessionScenario()
         server = FakeHighLevelServer(scenario)
@@ -225,6 +258,111 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         ])
         self.assertIs(scenario.received_low_level_server, server._mcp_server)
         self.assertTrue(scenario.low_level_resolved)
+
+    async def test_schema_admission_maps_canonical_symbol_to_live_symbols_array(self):
+        scenario = SessionScenario(
+            visible_tool_names=["get_stock_snapshot"],
+            tool_schemas={
+                "get_stock_snapshot": {
+                    "type": "object",
+                    "properties": {"symbols": {"type": "array", "items": {"type": "string"}}},
+                    "required": ["symbols"],
+                }
+            },
+        )
+        server = FakeHighLevelServer(scenario)
+        adapter = _make_adapter(scenario, server)
+
+        arguments = {"symbol": "SPY"}
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"get_stock_snapshot"}),
+            invocation=MCPInvocation("get_stock_snapshot", arguments),
+            timeout_seconds=1.0,
+            lifecycle_adapter=adapter,
+        )
+
+        self.assertEqual(receipt.failure_class, "NONE")
+        self.assertTrue(receipt.invocation_completed)
+        self.assertEqual(scenario.call_tool_arguments, [{"symbols": ["SPY"]}])
+        self.assertEqual(arguments, {"symbol": "SPY"})
+
+    async def test_schema_admission_refuses_malformed_schemas_without_call(self):
+        malformed = [
+            None,
+            [],
+            "schema",
+            {"type": "object"},
+            {"type": "object", "properties": []},
+            {"type": "object", "properties": {}},
+            {"type": "object", "properties": {"symbols": []}},
+            {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string"},
+                    "symbols": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["symbols"],
+            },
+            {"type": "object", "properties": {"symbols": {"type": "string"}}},
+            {
+                "type": "object",
+                "properties": {"symbols": {"type": "array"}},
+                "required": ["symbols"],
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "symbols": {"type": "array", "items": {"type": "number"}}
+                },
+                "required": ["symbols"],
+            },
+            {
+                "type": "object",
+                "properties": {"symbols": {"type": "array", "items": {"type": "string"}}},
+            },
+            {
+                "type": "object",
+                "properties": {"symbols": {"type": "array", "items": {"type": "string"}}},
+                "required": "symbols",
+            },
+            {
+                "type": "object",
+                "properties": {"symbols": {"type": "array", "items": {"type": "string"}}},
+                "required": ["symbols", "unsupported"],
+            },
+        ]
+        for schema in malformed:
+            with self.subTest(schema=schema):
+                receipt, scenario = await self._run_schema_case(schema, {"symbol": "SPY"})
+                self.assertEqual(receipt.failure_class, "SCHEMA_ADMISSION_FAILED")
+                self.assertEqual(scenario.call_tool_calls, 0)
+                self.assertFalse(receipt.execution_authority)
+
+    async def test_schema_admission_refuses_ambiguous_and_invalid_inputs(self):
+        schema = {
+            "type": "object",
+            "properties": {"symbols": {"type": "array", "items": {"type": "string"}}},
+            "required": ["symbols"],
+        }
+        invalid_arguments = [
+            {"symbol": "SPY", "symbols": ["SPY"]},
+            {"symbols": ["SPY"]},
+            {"symbol": "SPY", "extra": True},
+            {},
+            {"symbol": ""},
+            {"symbol": "   "},
+            {"symbol": None},
+            {"symbol": ["SPY"]},
+            {"symbol": 123},
+            {"symbol": True},
+        ]
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments):
+                receipt, scenario = await self._run_schema_case(schema, arguments)
+                self.assertEqual(receipt.failure_class, "SCHEMA_ADMISSION_FAILED")
+                self.assertEqual(scenario.call_tool_calls, 0)
+                self.assertFalse(receipt.execution_authority)
 
     async def test_forbidden_invocation_is_refused_before_handler_lookup(self):
         scenario = SessionScenario()
