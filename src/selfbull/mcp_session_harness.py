@@ -197,7 +197,7 @@ class _SchemaAdmissionError(ValueError):
 
 
 def _admit_invocation_arguments(tool: Any, arguments: Mapping[str, Any]) -> dict[str, Any]:
-    """Admit only the exact single-symbol-to-symbols-array contract."""
+    """Admit only the exact single-symbol snapshot contract."""
 
     schema = getattr(tool, "inputSchema", None)
     if schema is None:
@@ -206,15 +206,35 @@ def _admit_invocation_arguments(tool: Any, arguments: Mapping[str, Any]) -> dict
         raise _SchemaAdmissionError("unsupported schema")
 
     properties = schema.get("properties")
-    if not isinstance(properties, Mapping) or set(properties) != {"symbols"}:
+    expected_properties = {
+        "symbols",
+        "category",
+        "extend_hour_required",
+        "overnight_required",
+    }
+    if not isinstance(properties, Mapping) or set(properties) != expected_properties:
         raise _SchemaAdmissionError("unsupported properties")
 
     symbols_schema = properties.get("symbols")
-    if not isinstance(symbols_schema, Mapping) or symbols_schema.get("type") != "array":
+    if not isinstance(symbols_schema, Mapping) or symbols_schema.get("type") != "string":
         raise _SchemaAdmissionError("unsupported symbols schema")
-    items_schema = symbols_schema.get("items")
-    if not isinstance(items_schema, Mapping) or items_schema.get("type") != "string":
-        raise _SchemaAdmissionError("unsupported symbols items")
+
+    category_schema = properties.get("category")
+    if (
+        not isinstance(category_schema, Mapping)
+        or category_schema.get("type") != "string"
+        or category_schema.get("default") != "US_STOCK"
+    ):
+        raise _SchemaAdmissionError("unsupported category schema")
+
+    for field_name in ("extend_hour_required", "overnight_required"):
+        field_schema = properties.get(field_name)
+        if (
+            not isinstance(field_schema, Mapping)
+            or field_schema.get("type") != "boolean"
+            or field_schema.get("default") is not False
+        ):
+            raise _SchemaAdmissionError("unsupported session schema")
 
     required = schema.get("required")
     if not isinstance(required, (list, tuple)) or not all(
@@ -230,7 +250,7 @@ def _admit_invocation_arguments(tool: Any, arguments: Mapping[str, Any]) -> dict
     if not isinstance(symbol, str) or not symbol.strip():
         raise _SchemaAdmissionError("invalid canonical symbol")
 
-    return {"symbols": [symbol]}
+    return {"symbols": symbol}
 
 
 def _surface_matches(visible: Tuple[str, ...], expected_tool_names: frozenset[str]) -> bool:

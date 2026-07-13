@@ -20,18 +20,25 @@ from selfbull.mcp_session_harness import (  # noqa: E402
 )
 
 
+def _stock_snapshot_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "symbols": {"type": "string"},
+            "category": {"type": "string", "default": "US_STOCK"},
+            "extend_hour_required": {"type": "boolean", "default": False},
+            "overnight_required": {"type": "boolean", "default": False},
+        },
+        "required": ["symbols"],
+    }
+
+
 @dataclass
 class SessionScenario:
     visible_tool_names: list[str] = field(default_factory=lambda: ["fictional_snapshot"])
     tool_schemas: dict[str, dict | None] = field(
         default_factory=lambda: {
-            "fictional_snapshot": {
-                "type": "object",
-                "properties": {
-                    "symbols": {"type": "array", "items": {"type": "string"}}
-                },
-                "required": ["symbols"],
-            }
+            "fictional_snapshot": _stock_snapshot_schema()
         }
     )
     initialize_error: Optional[BaseException] = None
@@ -259,15 +266,11 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         self.assertIs(scenario.received_low_level_server, server._mcp_server)
         self.assertTrue(scenario.low_level_resolved)
 
-    async def test_schema_admission_maps_canonical_symbol_to_live_symbols_array(self):
+    async def test_schema_admission_maps_canonical_symbol_to_live_symbols_string(self):
         scenario = SessionScenario(
             visible_tool_names=["get_stock_snapshot"],
             tool_schemas={
-                "get_stock_snapshot": {
-                    "type": "object",
-                    "properties": {"symbols": {"type": "array", "items": {"type": "string"}}},
-                    "required": ["symbols"],
-                }
+                "get_stock_snapshot": _stock_snapshot_schema()
             },
         )
         server = FakeHighLevelServer(scenario)
@@ -284,7 +287,7 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
 
         self.assertEqual(receipt.failure_class, "NONE")
         self.assertTrue(receipt.invocation_completed)
-        self.assertEqual(scenario.call_tool_arguments, [{"symbols": ["SPY"]}])
+        self.assertEqual(scenario.call_tool_arguments, [{"symbols": "SPY"}])
         self.assertEqual(arguments, {"symbol": "SPY"})
 
     async def test_schema_admission_refuses_malformed_schemas_without_call(self):
@@ -300,35 +303,53 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
                 "type": "object",
                 "properties": {
                     "symbol": {"type": "string"},
+                    **_stock_snapshot_schema()["properties"],
+                },
+                "required": ["symbols"],
+            },
+            {
+                **_stock_snapshot_schema(),
+                "properties": {
+                    **_stock_snapshot_schema()["properties"],
                     "symbols": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["symbols"],
-            },
-            {"type": "object", "properties": {"symbols": {"type": "string"}}},
-            {
-                "type": "object",
-                "properties": {"symbols": {"type": "array"}},
-                "required": ["symbols"],
             },
             {
-                "type": "object",
+                **_stock_snapshot_schema(),
                 "properties": {
-                    "symbols": {"type": "array", "items": {"type": "number"}}
+                    **_stock_snapshot_schema()["properties"],
+                    "category": {"type": "string", "default": "CRYPTO"},
                 },
+            },
+            {
+                **_stock_snapshot_schema(),
+                "properties": {
+                    **_stock_snapshot_schema()["properties"],
+                    "extend_hour_required": {"type": "boolean", "default": True},
+                },
+            },
+            {
+                **_stock_snapshot_schema(),
+                "properties": {
+                    **_stock_snapshot_schema()["properties"],
+                    "overnight_required": {"type": "string", "default": False},
+                },
+            },
+            {
+                "type": "object",
+                "properties": {"symbols": {"type": "string"}},
                 "required": ["symbols"],
             },
             {
-                "type": "object",
-                "properties": {"symbols": {"type": "array", "items": {"type": "string"}}},
+                **_stock_snapshot_schema(),
+                "required": [],
             },
             {
-                "type": "object",
-                "properties": {"symbols": {"type": "array", "items": {"type": "string"}}},
+                **_stock_snapshot_schema(),
                 "required": "symbols",
             },
             {
-                "type": "object",
-                "properties": {"symbols": {"type": "array", "items": {"type": "string"}}},
+                **_stock_snapshot_schema(),
                 "required": ["symbols", "unsupported"],
             },
         ]
@@ -340,15 +361,14 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
                 self.assertFalse(receipt.execution_authority)
 
     async def test_schema_admission_refuses_ambiguous_and_invalid_inputs(self):
-        schema = {
-            "type": "object",
-            "properties": {"symbols": {"type": "array", "items": {"type": "string"}}},
-            "required": ["symbols"],
-        }
+        schema = _stock_snapshot_schema()
         invalid_arguments = [
             {"symbol": "SPY", "symbols": ["SPY"]},
             {"symbols": ["SPY"]},
             {"symbol": "SPY", "extra": True},
+            {"symbol": "SPY", "category": "US_STOCK"},
+            {"symbol": "SPY", "extend_hour_required": False},
+            {"symbol": "SPY", "overnight_required": False},
             {},
             {"symbol": ""},
             {"symbol": "   "},
