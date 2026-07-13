@@ -2,8 +2,9 @@
 
 This module is deliberately offline. It does not start MCP, authenticate,
 read token state, invoke a broker, write fixtures, or append to a ledger.
-Only an explicitly fictional formatter contract is registered for initial
-proof; real Webull formatter admission requires a fresh governed capture.
+Only explicitly versioned formatter contracts are registered.  The Webull
+MCP 1.1.6 contract accepts source identity and formatter text supplied by a
+separately governed capture boundary; this module never performs that capture.
 """
 
 from __future__ import annotations
@@ -27,6 +28,31 @@ FICTIONAL_FORMATTER_SHAPE_ID = "fictional.stock_snapshot.kv.v1"
 FICTIONAL_RESULT_CONTAINER_TYPE = "CallToolResult"
 FICTIONAL_HEADER = "FORMAT=FICTIONAL_STOCK_SNAPSHOT_V1"
 
+WEBULL_MCP_SOURCE_PACKAGE = "webull-openapi-mcp"
+WEBULL_MCP_SOURCE_PACKAGE_VERSION = "1.1.6"
+WEBULL_MCP_FORMATTER_SHAPE_ID = (
+    "004B.womcp-1.1.6.stock-snapshot.us-default."
+    "single-symbol.fundamentals.v1"
+)
+WEBULL_MCP_RESULT_CONTAINER_TYPE = "CallToolResult"
+_MCP_CALL_TOOL_RESULT_TYPE: Optional[type] = None
+WEBULL_MCP_SOURCE_FILE_HASHES = MappingProxyType(
+    {
+        "tools/market_data/stock.py": (
+            "b58d4bda3169f93a4d87ddb021c14e29e1fab8cf1d3df738a93e7c0de68fbab5"
+        ),
+        "formatters.py": (
+            "f0cd28003934a07cef23e1b07f70864563b6823469cb0f404974ba748f59555d"
+        ),
+    }
+)
+WEBULL_MCP_US_DISCLAIMER_LINE = (
+    "⚠️ Disclaimer: The information provided by this tool is for reference "
+    "only and does not constitute investment advice. Trading involves risk; "
+    "please make decisions carefully."
+)
+WEBULL_MCP_HEADER = "=== Stock Snapshot ==="
+
 FAILURE_CLASSES = frozenset(
     {
         "UNKNOWN_FORMATTER_SHAPE",
@@ -44,6 +70,12 @@ FAILURE_CLASSES = frozenset(
         "TRANSPORT_RECEIPT_INVALID",
         "RAW_REFERENCE_INVALID",
         "HUMAN_REVIEW_REQUIRED",
+        "SOURCE_HASH_MISMATCH",
+        "DISCLAIMER_MISMATCH",
+        "LINE_COUNT_MISMATCH",
+        "FIELD_LAYOUT_MISMATCH",
+        "MULTI_SYMBOL_RESPONSE",
+        "OPTIONAL_SECTION_UNSUPPORTED",
     }
 )
 
@@ -65,6 +97,49 @@ _EXPECTED_MARKET_FIELDS = frozenset(
     {"last_price", "bid", "ask", "spread", "volume", "market_status", "delayed"}
 )
 _EXPECTED_DERIVATIVE_ADMITTED_FIELDS = tuple(sorted((*_EXPECTED_KEYS, "spread")))
+_WEBULL_BROKER_FIELD_NAMES = (
+    "symbol",
+    "price",
+    "pre_close",
+    "change",
+    "change_ratio",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "bid",
+    "bid_size",
+    "ask",
+    "ask_size",
+    "turnover",
+    "eps",
+    "eps_ttm",
+    "lot_size",
+    "bps",
+)
+_WEBULL_ADMITTED_FIELD_NAMES = tuple(
+    sorted(("symbol", "last_price", "bid", "ask", "volume", "spread"))
+)
+_WEBULL_RECOGNIZED_NOT_ADMITTED_FIELD_NAMES = (
+    "pre_close",
+    "change",
+    "change_ratio",
+    "open",
+    "high",
+    "low",
+    "close",
+    "bid_size",
+    "ask_size",
+    "turnover",
+    "eps",
+    "eps_ttm",
+    "lot_size",
+    "bps",
+)
+_WEBULL_MARKET_FIELDS = frozenset(
+    {"last_price", "bid", "ask", "spread", "volume"}
+)
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SAFE_SYMBOL = re.compile(r"^[A-Za-z0-9.^:/_-]{1,32}$")
 _DERIVATIVE_CONSTRUCTION_SEAL = object()
@@ -72,10 +147,47 @@ _FORBIDDEN_VOCABULARY = re.compile(
     r"(?i)\b(account|balance|position|order|watchlist|trade|recommendation|prediction)\b"
 )
 _SECRET_PATTERN = re.compile(
-    r"(?i)(bearer\s+|access[_-]?token|refresh[_-]?token|app[_-]?secret|signature|x-sign)"
+    r"(?i)("
+    r"\b(?:webull[\s_-]*)?app[\s_-]*key(?:[\s_-]*id)?\b|"
+    r"\b(?:webull[\s_-]*)?app[\s_-]*secret\b|"
+    r"\bbearer(?:[\s_-]*token\b|\s+|\s*[:=])|"
+    r"\baccess[\s_-]*token\b|"
+    r"\brefresh[\s_-]*token\b|"
+    r"\bauthorization\b|"
+    r"\bsignature\b|"
+    r"\bx-sign\b"
+    r")"
 )
 _IDENTITY_PATTERN = re.compile(
-    r"(?i)(account[_-]?(id|number)|request[_-]?id|trace[_-]?id|/users/|\\users\\)"
+    r"(?i)("
+    r"\baccount[\s_-]*(?:id|identifier|number)\b|"
+    r"\brequest[\s_-]*(?:id|identifier)\b|"
+    r"\btrace[\s_-]*(?:id|identifier)\b|"
+    r"\bsession[\s_-]*(?:id|identifier)\b|"
+    r"\bprofile[\s_-]*(?:path|dir|directory)\b|"
+    r"\b(?:home|userprofile)(?:[\s_-]*(?:path|dir|directory))?\s*[:=]\s*"
+    r"(?:~[/\\]|/|\\|[A-Za-z]:[/\\])|"
+    r"(?:^|[\s=:'\"])(?:~[/\\]|/(?:users|home)/|\\users\\|/profiles?/|\\profiles\\)"
+    r")"
+)
+
+_WEBULL_PRIMARY_LINE = re.compile(
+    r"^  (?P<symbol>.+?)  Price: (?P<price>.+?)  "
+    r"PreClose: (?P<pre_close>.+?)  Change: (?P<change>.+?)  "
+    r"Change%: (?P<change_ratio>.+)$"
+)
+_WEBULL_OHLCV_LINE = re.compile(
+    r"^ {12}Open: (?P<open>.+?)  High: (?P<high>.+?)  "
+    r"Low: (?P<low>.+?)  Close: (?P<close>.+?)  Vol: (?P<volume>.+)$"
+)
+_WEBULL_QUOTE_LINE = re.compile(
+    r"^ {12}Bid: (?P<bid>.+?) x (?P<bid_size>.+?)  "
+    r"Ask: (?P<ask>.+?) x (?P<ask_size>.+)$"
+)
+_WEBULL_FUNDAMENTALS_LINE = re.compile(
+    r"^ {12}Turnover: (?P<turnover>.+?)  EPS: (?P<eps>.+?)  "
+    r"EPS\(TTM\): (?P<eps_ttm>.+?)  Lot Size: (?P<lot_size>.+?)  "
+    r"BPS: (?P<bps>.+)$"
 )
 
 
@@ -278,6 +390,7 @@ class ScrubbedSnapshotDerivative:
     market_fields: Mapping[str, Optional[str]]
     null_field_names: Tuple[str, ...]
     unknown_fields: Tuple[str, ...]
+    recognized_but_not_admitted_field_names: Tuple[str, ...] = ()
     _construction_seal: InitVar[object] = None
     parse_status: str = "CANDIDATE"
     human_review_status: str = "PENDING"
@@ -303,12 +416,18 @@ class ScrubbedSnapshotDerivative:
             not _is_safe_identifier(self.revision_of) or self.revision_of in identifiers
         ):
             raise ValueError("revision identity is invalid")
-        if self.source_package != FICTIONAL_SOURCE_PACKAGE:
+        if self.source_package != WEBULL_MCP_SOURCE_PACKAGE:
             raise ValueError("source package is unsupported")
-        if self.source_package_version != FICTIONAL_SOURCE_PACKAGE_VERSION:
-            raise ValueError("source package version is unsupported")
-        if self.formatter_shape_id != FICTIONAL_FORMATTER_SHAPE_ID:
-            raise ValueError("formatter shape is unsupported")
+        fictional_contract = (
+            self.source_package_version == FICTIONAL_SOURCE_PACKAGE_VERSION
+            and self.formatter_shape_id == FICTIONAL_FORMATTER_SHAPE_ID
+        )
+        webull_116_contract = (
+            self.source_package_version == WEBULL_MCP_SOURCE_PACKAGE_VERSION
+            and self.formatter_shape_id == WEBULL_MCP_FORMATTER_SHAPE_ID
+        )
+        if not (fictional_contract or webull_116_contract):
+            raise ValueError("source formatter contract is unsupported")
         if not isinstance(self.instrument_symbol, str) or not _SAFE_SYMBOL.fullmatch(
             self.instrument_symbol
         ):
@@ -321,33 +440,53 @@ class ScrubbedSnapshotDerivative:
             raise ValueError("observed_at source is invalid")
         if (self.observed_at is None) != (self.observed_at_source == "UNAVAILABLE"):
             raise ValueError("observed_at source contradicts observed_at")
-        if self.broker_field_names != _EXPECTED_KEYS:
+        expected_broker_fields = (
+            _EXPECTED_KEYS if fictional_contract else _WEBULL_BROKER_FIELD_NAMES
+        )
+        expected_admitted_fields = (
+            _EXPECTED_DERIVATIVE_ADMITTED_FIELDS
+            if fictional_contract
+            else _WEBULL_ADMITTED_FIELD_NAMES
+        )
+        expected_recognized_not_admitted = (
+            ()
+            if fictional_contract
+            else _WEBULL_RECOGNIZED_NOT_ADMITTED_FIELD_NAMES
+        )
+        expected_market_fields = (
+            _EXPECTED_MARKET_FIELDS if fictional_contract else _WEBULL_MARKET_FIELDS
+        )
+        if self.broker_field_names != expected_broker_fields:
             raise ValueError("broker field names are unsupported")
-        if self.admitted_field_names != _EXPECTED_DERIVATIVE_ADMITTED_FIELDS:
+        if self.admitted_field_names != expected_admitted_fields:
             raise ValueError("admitted field names are unsupported")
+        if (
+            self.recognized_but_not_admitted_field_names
+            != expected_recognized_not_admitted
+        ):
+            raise ValueError("recognized non-admitted fields are unsupported")
         if (
             self.rejected_field_names != ()
             or self.ambiguous_field_names != ()
             or self.unknown_fields != ()
         ):
             raise ValueError("candidate contains unresolved fields")
-        if not isinstance(self.market_fields, Mapping) or set(self.market_fields) != _EXPECTED_MARKET_FIELDS:
+        if (
+            not isinstance(self.market_fields, Mapping)
+            or set(self.market_fields) != expected_market_fields
+        ):
             raise ValueError("market fields are unsupported")
         market_fields = dict(self.market_fields)
-        required_string_fields = (
-            "last_price",
-            "bid",
-            "ask",
-            "spread",
-            "volume",
-            "market_status",
-        )
+        required_string_fields = ("last_price", "bid", "ask", "spread", "volume")
+        if fictional_contract:
+            required_string_fields = (*required_string_fields, "market_status")
         if any(not isinstance(market_fields[name], str) for name in required_string_fields):
             raise ValueError("market field value type is invalid")
-        if market_fields["delayed"] is not None and not isinstance(
-            market_fields["delayed"], str
-        ):
-            raise ValueError("delayed value type is invalid")
+        if fictional_contract:
+            if market_fields["delayed"] is not None and not isinstance(
+                market_fields["delayed"], str
+            ):
+                raise ValueError("delayed value type is invalid")
         try:
             last_price = _parse_nonnegative_decimal(market_fields["last_price"])
             bid = _parse_nonnegative_decimal(market_fields["bid"])
@@ -358,21 +497,33 @@ class ScrubbedSnapshotDerivative:
             raise ValueError("market field value is invalid") from exc
         if Decimal(ask) < Decimal(bid) or spread != str(Decimal(ask) - Decimal(bid)):
             raise ValueError("spread does not match bid and ask")
-        if market_fields["market_status"] not in {
-            "OPEN",
-            "CLOSED",
-            "PRE",
-            "AFTER",
-            "UNKNOWN",
-        }:
-            raise ValueError("market status is invalid")
-        if market_fields["delayed"] not in {"true", "false", None}:
-            raise ValueError("delayed status is invalid")
-        expected_null_fields = tuple(
-            sorted(name for name, value in market_fields.items() if value is None)
-        )
-        if self.null_field_names != expected_null_fields:
-            raise ValueError("null field names contradict market fields")
+        if fictional_contract:
+            if market_fields["market_status"] not in {
+                "OPEN",
+                "CLOSED",
+                "PRE",
+                "AFTER",
+                "UNKNOWN",
+            }:
+                raise ValueError("market status is invalid")
+            if market_fields["delayed"] not in {"true", "false", None}:
+                raise ValueError("delayed status is invalid")
+            expected_null_fields = tuple(
+                sorted(name for name, value in market_fields.items() if value is None)
+            )
+            if self.null_field_names != expected_null_fields:
+                raise ValueError("null field names contradict market fields")
+        else:
+            if self.observed_at is not None or self.observed_at_source != "UNAVAILABLE":
+                raise ValueError("Webull formatter does not supply observation time")
+            if (
+                len(self.null_field_names) != len(set(self.null_field_names))
+                or self.null_field_names != tuple(sorted(self.null_field_names))
+                or not set(self.null_field_names).issubset(
+                    set(_WEBULL_RECOGNIZED_NOT_ADMITTED_FIELD_NAMES)
+                )
+            ):
+                raise ValueError("null field names contradict formatter contract")
         if self.parse_status != "CANDIDATE":
             raise ValueError("parse status is invalid")
         if self.human_review_status not in {"PENDING", "APPROVED"}:
@@ -409,6 +560,9 @@ class ScrubbedSnapshotDerivative:
             "admitted_field_names": list(self.admitted_field_names),
             "rejected_field_names": list(self.rejected_field_names),
             "ambiguous_field_names": list(self.ambiguous_field_names),
+            "recognized_but_not_admitted_field_names": list(
+                self.recognized_but_not_admitted_field_names
+            ),
             "market_fields": dict(self.market_fields),
             "null_field_names": list(self.null_field_names),
             "unknown_fields": list(self.unknown_fields),
@@ -445,15 +599,17 @@ class AdmissionRefusal:
     def __post_init__(self) -> None:
         if self.failure_class not in FAILURE_CLASSES:
             raise ValueError("unsupported admission failure class")
-        if self.source_package not in {FICTIONAL_SOURCE_PACKAGE, "UNSUPPORTED"}:
+        if self.source_package not in {WEBULL_MCP_SOURCE_PACKAGE, "UNSUPPORTED"}:
             raise ValueError("unsafe refusal source package")
         if self.source_package_version not in {
             FICTIONAL_SOURCE_PACKAGE_VERSION,
+            WEBULL_MCP_SOURCE_PACKAGE_VERSION,
             "UNSUPPORTED",
         }:
             raise ValueError("unsafe refusal source package version")
         if self.formatter_shape_id not in {
             FICTIONAL_FORMATTER_SHAPE_ID,
+            WEBULL_MCP_FORMATTER_SHAPE_ID,
             "UNSUPPORTED",
         }:
             raise ValueError("unsafe refusal formatter shape")
@@ -501,18 +657,20 @@ def _refusal(
     return AdmissionRefusal(
         failure_class=failure_class,
         source_package=(
-            FICTIONAL_SOURCE_PACKAGE
-            if source_package == FICTIONAL_SOURCE_PACKAGE
+            WEBULL_MCP_SOURCE_PACKAGE
+            if source_package == WEBULL_MCP_SOURCE_PACKAGE
             else "UNSUPPORTED"
         ),
         source_package_version=(
-            FICTIONAL_SOURCE_PACKAGE_VERSION
-            if source_package_version == FICTIONAL_SOURCE_PACKAGE_VERSION
+            source_package_version
+            if source_package_version
+            in {FICTIONAL_SOURCE_PACKAGE_VERSION, WEBULL_MCP_SOURCE_PACKAGE_VERSION}
             else "UNSUPPORTED"
         ),
         formatter_shape_id=(
-            FICTIONAL_FORMATTER_SHAPE_ID
-            if formatter_shape_id == FICTIONAL_FORMATTER_SHAPE_ID
+            formatter_shape_id
+            if formatter_shape_id
+            in {FICTIONAL_FORMATTER_SHAPE_ID, WEBULL_MCP_FORMATTER_SHAPE_ID}
             else "UNSUPPORTED"
         ),
         raw_reference_id=_safe_identifier(raw_reference_id),
@@ -604,6 +762,298 @@ def _parse_fictional_content(content: str, *, expected_symbol: str) -> Dict[str,
     }
 
 
+def _source_hashes_match(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    try:
+        supplied = dict(value)
+    except Exception:
+        return False
+    return supplied == dict(WEBULL_MCP_SOURCE_FILE_HASHES) and all(
+        isinstance(key, str) and isinstance(digest, str)
+        for key, digest in supplied.items()
+    )
+
+
+def _admitted_arguments_match(value: Any, *, expected_symbol: str) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    try:
+        supplied = dict(value)
+    except Exception:
+        return False
+    return (
+        set(supplied) == {"symbols"}
+        and type(supplied["symbols"]) is str
+        and supplied["symbols"] == expected_symbol
+    )
+
+
+def _aligned_value(field_value: str, width: int) -> str:
+    value = field_value.lstrip(" ")
+    if (
+        not value
+        or any(character.isspace() for character in value)
+        or field_value != value.rjust(width)
+    ):
+        raise _ParserRefusal("FIELD_LAYOUT_MISMATCH")
+    return value
+
+
+def _match_webull_line(
+    pattern: re.Pattern[str],
+    line: str,
+    widths: Mapping[str, int],
+) -> Dict[str, str]:
+    match = pattern.fullmatch(line)
+    if match is None:
+        raise _ParserRefusal("FIELD_LAYOUT_MISMATCH")
+    return {
+        name: _aligned_value(match.group(name), width)
+        for name, width in widths.items()
+    }
+
+
+def _validate_formatter_decimal(
+    value: str,
+    *,
+    required: bool,
+    nonnegative: bool,
+) -> Optional[str]:
+    if value == "N/A":
+        if required:
+            raise _ParserRefusal("REQUIRED_FIELD_MISSING")
+        return None
+    try:
+        parsed = Decimal(value)
+    except (InvalidOperation, ValueError) as exc:
+        raise _ParserRefusal("VALUE_TYPE_INVALID") from exc
+    if not parsed.is_finite() or (nonnegative and parsed < 0):
+        raise _ParserRefusal("VALUE_TYPE_INVALID")
+    return value
+
+
+def _validate_formatter_whole(
+    value: str,
+    *,
+    required: bool,
+) -> Optional[str]:
+    if value == "N/A":
+        if required:
+            raise _ParserRefusal("REQUIRED_FIELD_MISSING")
+        return None
+    if not value.isdigit():
+        raise _ParserRefusal("VALUE_TYPE_INVALID")
+    return value
+
+
+def _parse_webull_mcp_116_content(
+    content: str,
+    *,
+    expected_symbol: str,
+) -> Dict[str, Any]:
+    lines = content.split("\n")
+    if not lines or lines[0] != WEBULL_MCP_US_DISCLAIMER_LINE:
+        raise _ParserRefusal("DISCLAIMER_MISMATCH")
+    if len(lines) < 2 or lines[1] != "":
+        raise _ParserRefusal("DISCLAIMER_MISMATCH")
+    if any(
+        marker in line
+        for line in lines
+        for marker in ("ExtHr Price:", "OVN Price:", "OVN Bid:", "OVN Ask:")
+    ):
+        raise _ParserRefusal("OPTIONAL_SECTION_UNSUPPORTED")
+    if (
+        sum(line == WEBULL_MCP_HEADER for line in lines) > 1
+        or sum("  Price:" in line and "PreClose:" in line for line in lines) > 1
+    ):
+        raise _ParserRefusal("MULTI_SYMBOL_RESPONSE")
+    if len(lines) != 7:
+        raise _ParserRefusal("LINE_COUNT_MISMATCH")
+    if lines[2] != WEBULL_MCP_HEADER:
+        raise _ParserRefusal("FIELD_LAYOUT_MISMATCH")
+
+    primary = _match_webull_line(
+        _WEBULL_PRIMARY_LINE,
+        lines[3],
+        {
+            "symbol": 8,
+            "price": 10,
+            "pre_close": 10,
+            "change": 8,
+            "change_ratio": 8,
+        },
+    )
+    ohlcv = _match_webull_line(
+        _WEBULL_OHLCV_LINE,
+        lines[4],
+        {"open": 10, "high": 10, "low": 10, "close": 10, "volume": 12},
+    )
+    quotes = _match_webull_line(
+        _WEBULL_QUOTE_LINE,
+        lines[5],
+        {"bid": 10, "bid_size": 6, "ask": 10, "ask_size": 6},
+    )
+    fundamentals = _match_webull_line(
+        _WEBULL_FUNDAMENTALS_LINE,
+        lines[6],
+        {"turnover": 12, "eps": 8, "eps_ttm": 8, "lot_size": 6, "bps": 8},
+    )
+    if primary["symbol"] != expected_symbol:
+        raise _ParserRefusal("SYMBOL_MISMATCH")
+
+    last_price = _validate_formatter_decimal(
+        primary["price"], required=True, nonnegative=True
+    )
+    bid = _validate_formatter_decimal(quotes["bid"], required=True, nonnegative=True)
+    ask = _validate_formatter_decimal(quotes["ask"], required=True, nonnegative=True)
+    volume = _validate_formatter_whole(ohlcv["volume"], required=True)
+    assert last_price is not None and bid is not None and ask is not None
+    assert volume is not None
+    if Decimal(ask) < Decimal(bid):
+        raise _ParserRefusal("VALUE_TYPE_INVALID")
+
+    nullable_values = {
+        "pre_close": _validate_formatter_decimal(
+            primary["pre_close"], required=False, nonnegative=True
+        ),
+        "change": _validate_formatter_decimal(
+            primary["change"], required=False, nonnegative=False
+        ),
+        "change_ratio": _validate_formatter_decimal(
+            primary["change_ratio"], required=False, nonnegative=False
+        ),
+        "open": _validate_formatter_decimal(
+            ohlcv["open"], required=False, nonnegative=True
+        ),
+        "high": _validate_formatter_decimal(
+            ohlcv["high"], required=False, nonnegative=True
+        ),
+        "low": _validate_formatter_decimal(
+            ohlcv["low"], required=False, nonnegative=True
+        ),
+        "close": _validate_formatter_decimal(
+            ohlcv["close"], required=False, nonnegative=True
+        ),
+        "bid_size": _validate_formatter_whole(quotes["bid_size"], required=False),
+        "ask_size": _validate_formatter_whole(quotes["ask_size"], required=False),
+        "turnover": _validate_formatter_decimal(
+            fundamentals["turnover"], required=False, nonnegative=True
+        ),
+        "eps": _validate_formatter_decimal(
+            fundamentals["eps"], required=False, nonnegative=False
+        ),
+        "eps_ttm": _validate_formatter_decimal(
+            fundamentals["eps_ttm"], required=False, nonnegative=False
+        ),
+        "lot_size": _validate_formatter_whole(
+            fundamentals["lot_size"], required=False
+        ),
+        "bps": _validate_formatter_decimal(
+            fundamentals["bps"], required=False, nonnegative=False
+        ),
+    }
+    if all(
+        nullable_values[name] is None
+        for name in ("turnover", "eps", "eps_ttm", "lot_size", "bps")
+    ):
+        raise _ParserRefusal("FIELD_LAYOUT_MISMATCH")
+
+    return {
+        "observed_at": None,
+        "observed_at_source": "UNAVAILABLE",
+        "market_fields": {
+            "last_price": last_price,
+            "bid": bid,
+            "ask": ask,
+            "spread": str(Decimal(ask) - Decimal(bid)),
+            "volume": volume,
+        },
+        "null_field_names": tuple(
+            sorted(name for name, value in nullable_values.items() if value is None)
+        ),
+        "broker_field_names": _WEBULL_BROKER_FIELD_NAMES,
+        "admitted_field_names": _WEBULL_ADMITTED_FIELD_NAMES,
+        "recognized_but_not_admitted_field_names": (
+            _WEBULL_RECOGNIZED_NOT_ADMITTED_FIELD_NAMES
+        ),
+    }
+
+
+def _extract_original_mcp_result(result_container: Any) -> str:
+    """Validate the original low-level MCP envelope before reading formatter text."""
+
+    expected_result_type = _MCP_CALL_TOOL_RESULT_TYPE
+    if expected_result_type is None:
+        try:
+            from mcp.types import CallToolResult as expected_result_type
+        except Exception as exc:
+            raise _ParserRefusal("RESULT_CONTAINER_MISSING") from exc
+    if type(result_container) is not expected_result_type:
+        raise _ParserRefusal("RESULT_CONTAINER_MISSING")
+
+    missing = object()
+    try:
+        structured_content = getattr(result_container, "structuredContent", missing)
+        error_flag = getattr(result_container, "isError", missing)
+        snake_structured_content = getattr(
+            result_container,
+            "structured_content",
+            missing,
+        )
+        snake_error_flag = getattr(result_container, "is_error", missing)
+        top_level_result = getattr(result_container, "result", missing)
+        parsed_data = getattr(result_container, "data", missing)
+        extracted_result = getattr(
+            result_container,
+            "structured_content_result",
+            missing,
+        )
+        model_extra = getattr(result_container, "model_extra", missing)
+    except Exception as exc:
+        raise _ParserRefusal("RESULT_CONTAINER_MISSING") from exc
+
+    if any(
+        value is not missing
+        for value in (
+            snake_structured_content,
+            snake_error_flag,
+            top_level_result,
+            parsed_data,
+            extracted_result,
+        )
+    ):
+        raise _ParserRefusal("AMBIGUOUS_FIELD")
+    if model_extra is not missing and model_extra is not None:
+        if not isinstance(model_extra, Mapping):
+            raise _ParserRefusal("VALUE_TYPE_INVALID")
+        if model_extra:
+            raise _ParserRefusal("AMBIGUOUS_FIELD")
+    if error_flag is not missing and type(error_flag) is not bool:
+        raise _ParserRefusal("VALUE_TYPE_INVALID")
+    if error_flag is True:
+        raise _ParserRefusal("RESULT_CONTAINER_MISSING")
+    if structured_content is missing or structured_content is None:
+        raise _ParserRefusal("STRUCTURED_CONTENT_MISSING")
+    if not isinstance(structured_content, Mapping):
+        raise _ParserRefusal("VALUE_TYPE_INVALID")
+    try:
+        structured_snapshot = dict(structured_content)
+    except Exception as exc:
+        raise _ParserRefusal("VALUE_TYPE_INVALID") from exc
+    if "result" not in structured_snapshot:
+        raise _ParserRefusal("RESULT_CONTAINER_MISSING")
+    if set(structured_snapshot) != {"result"}:
+        raise _ParserRefusal("AMBIGUOUS_FIELD")
+
+    formatter_result = structured_snapshot["result"]
+    if not isinstance(formatter_result, str):
+        raise _ParserRefusal("VALUE_TYPE_INVALID")
+    if len(formatter_result) > 10_000:
+        raise _ParserRefusal("VALUE_TYPE_INVALID")
+    return formatter_result
+
+
 def admit_formatted_snapshot(
     *,
     transport_receipt: TransportReceipt,
@@ -613,8 +1063,9 @@ def admit_formatted_snapshot(
     source_package: str,
     source_package_version: str,
     formatter_shape_id: str,
-    result_container_type: str,
-    structured_content_result: Optional[str],
+    result_container: Any,
+    source_file_hashes: Optional[Mapping[str, str]] = None,
+    admitted_arguments: Optional[Mapping[str, Any]] = None,
     revision_of: Optional[str] = None,
 ) -> AdmissionOutcome:
     """Build a scrubbed candidate or return a value-free categorical refusal."""
@@ -635,20 +1086,38 @@ def admit_formatted_snapshot(
             return _refusal("RAW_REFERENCE_INVALID", **refusal_args)
         if transport_receipt.capture_session_id != raw_reference.capture_session_id:
             return _refusal("RAW_REFERENCE_INVALID", **refusal_args)
-        if source_package != FICTIONAL_SOURCE_PACKAGE or source_package_version != FICTIONAL_SOURCE_PACKAGE_VERSION:
+        structured_content_result = _extract_original_mcp_result(result_container)
+        if _SECRET_PATTERN.search(structured_content_result):
+            return _refusal("SECRET_PATTERN_PRESENT", **refusal_args)
+        if _IDENTITY_PATTERN.search(structured_content_result):
+            return _refusal("IDENTITY_PATTERN_PRESENT", **refusal_args)
+        if source_package != WEBULL_MCP_SOURCE_PACKAGE:
             return _refusal("UNSUPPORTED_PACKAGE_VERSION", **refusal_args)
-        if formatter_shape_id != FICTIONAL_FORMATTER_SHAPE_ID:
+        if source_package_version not in {
+            FICTIONAL_SOURCE_PACKAGE_VERSION,
+            WEBULL_MCP_SOURCE_PACKAGE_VERSION,
+        }:
+            return _refusal("UNSUPPORTED_PACKAGE_VERSION", **refusal_args)
+        fictional_contract = (
+            source_package_version == FICTIONAL_SOURCE_PACKAGE_VERSION
+            and formatter_shape_id == FICTIONAL_FORMATTER_SHAPE_ID
+        )
+        webull_116_contract = (
+            source_package_version == WEBULL_MCP_SOURCE_PACKAGE_VERSION
+            and formatter_shape_id == WEBULL_MCP_FORMATTER_SHAPE_ID
+        )
+        if not (fictional_contract or webull_116_contract):
             return _refusal("UNKNOWN_FORMATTER_SHAPE", **refusal_args)
-        if result_container_type != FICTIONAL_RESULT_CONTAINER_TYPE:
-            return _refusal("RESULT_CONTAINER_MISSING", **refusal_args)
-        if structured_content_result is None:
-            return _refusal("STRUCTURED_CONTENT_MISSING", **refusal_args)
-        if not isinstance(structured_content_result, str):
-            return _refusal("VALUE_TYPE_INVALID", **refusal_args)
-        if len(structured_content_result) > 10_000:
-            return _refusal("VALUE_TYPE_INVALID", **refusal_args)
         if not isinstance(expected_symbol, str) or not _SAFE_SYMBOL.fullmatch(expected_symbol):
             return _refusal("SYMBOL_MISMATCH", **refusal_args)
+        if webull_116_contract:
+            if not _source_hashes_match(source_file_hashes):
+                return _refusal("SOURCE_HASH_MISMATCH", **refusal_args)
+            if not _admitted_arguments_match(
+                admitted_arguments,
+                expected_symbol=expected_symbol,
+            ):
+                return _refusal("FIELD_LAYOUT_MISMATCH", **refusal_args)
         if not _is_safe_identifier(derivative_id):
             return _refusal("VALUE_TYPE_INVALID", **refusal_args)
         if derivative_id in {raw_reference.raw_reference_id, transport_receipt.transport_receipt_id}:
@@ -657,17 +1126,27 @@ def admit_formatted_snapshot(
             not _is_safe_identifier(revision_of) or revision_of == derivative_id
         ):
             return _refusal("VALUE_TYPE_INVALID", **refusal_args)
-        if _SECRET_PATTERN.search(structured_content_result):
-            return _refusal("SECRET_PATTERN_PRESENT", **refusal_args)
-        if _IDENTITY_PATTERN.search(structured_content_result):
-            return _refusal("IDENTITY_PATTERN_PRESENT", **refusal_args)
         if _FORBIDDEN_VOCABULARY.search(structured_content_result):
             return _refusal("AMBIGUOUS_FIELD", **refusal_args)
 
-        parsed = _parse_fictional_content(
-            structured_content_result,
-            expected_symbol=expected_symbol,
-        )
+        if fictional_contract:
+            parsed = _parse_fictional_content(
+                structured_content_result,
+                expected_symbol=expected_symbol,
+            )
+            broker_field_names = _EXPECTED_KEYS
+            admitted_field_names = _EXPECTED_DERIVATIVE_ADMITTED_FIELDS
+            recognized_but_not_admitted_field_names: Tuple[str, ...] = ()
+        else:
+            parsed = _parse_webull_mcp_116_content(
+                structured_content_result,
+                expected_symbol=expected_symbol,
+            )
+            broker_field_names = parsed["broker_field_names"]
+            admitted_field_names = parsed["admitted_field_names"]
+            recognized_but_not_admitted_field_names = parsed[
+                "recognized_but_not_admitted_field_names"
+            ]
         return ScrubbedSnapshotDerivative(
             derivative_id=derivative_id,
             source_package=source_package,
@@ -680,13 +1159,16 @@ def admit_formatted_snapshot(
             observed_at=parsed["observed_at"],
             recorded_at=raw_reference.capture_recorded_at,
             observed_at_source=parsed["observed_at_source"],
-            broker_field_names=_EXPECTED_KEYS,
-            admitted_field_names=tuple(sorted((*_EXPECTED_KEYS, "spread"))),
+            broker_field_names=broker_field_names,
+            admitted_field_names=admitted_field_names,
             rejected_field_names=(),
             ambiguous_field_names=(),
             market_fields=parsed["market_fields"],
             null_field_names=parsed["null_field_names"],
             unknown_fields=(),
+            recognized_but_not_admitted_field_names=(
+                recognized_but_not_admitted_field_names
+            ),
             _construction_seal=_DERIVATIVE_CONSTRUCTION_SEAL,
         )
     except _ParserRefusal as exc:

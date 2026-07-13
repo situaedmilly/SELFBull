@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import sys
 from dataclasses import FrozenInstanceError, replace
 from unittest import TestCase
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
@@ -19,9 +21,73 @@ from selfbull.snapshot_receipt_admission import (  # noqa: E402
     RawWitnessReference,
     ScrubbedSnapshotDerivative,
     TransportReceipt,
+    WEBULL_MCP_FORMATTER_SHAPE_ID,
+    WEBULL_MCP_HEADER,
+    WEBULL_MCP_SOURCE_FILE_HASHES,
+    WEBULL_MCP_SOURCE_PACKAGE,
+    WEBULL_MCP_SOURCE_PACKAGE_VERSION,
+    WEBULL_MCP_US_DISCLAIMER_LINE,
     admit_formatted_snapshot,
     register_human_approved_derivative,
 )
+
+
+_MISSING = object()
+
+
+class CallToolResult:
+    """Offline model of the original low-level MCP result envelope."""
+
+    def __init__(
+        self,
+        *,
+        structured_content=_MISSING,
+        is_error=False,
+        content=None,
+        meta=None,
+    ):
+        if structured_content is not _MISSING:
+            self.structuredContent = structured_content
+        if is_error is not _MISSING:
+            self.isError = is_error
+        self.content = [] if content is None else content
+        self._meta = meta
+
+
+CallToolResult.__module__ = "mcp.types"
+
+
+def _result_container(
+    content,
+    *,
+    container_type="CallToolResult",
+    structured_content=_MISSING,
+    is_error=False,
+):
+    envelope_content = (
+        {"result": content}
+        if structured_content is _MISSING
+        else structured_content
+    )
+    if container_type == "CallToolResult":
+        return CallToolResult(
+            structured_content=envelope_content,
+            is_error=is_error,
+        )
+    other_type = type(container_type, (), {})
+    envelope = other_type()
+    envelope.structuredContent = envelope_content
+    envelope.isError = is_error
+    return envelope
+
+
+def _legacy_result_overrides(overrides, *, default_content):
+    result_container = overrides.pop("result_container", _MISSING)
+    if result_container is not _MISSING:
+        return result_container
+    content = overrides.pop("structured_content_result", default_content)
+    container_type = overrides.pop("result_container_type", "CallToolResult")
+    return _result_container(content, container_type=container_type)
 
 
 def _transport(**overrides):
@@ -85,6 +151,10 @@ def _content(**overrides):
 
 
 def _admit(**overrides):
+    result_container = _legacy_result_overrides(
+        overrides,
+        default_content=_content(),
+    )
     values = {
         "transport_receipt": _transport(),
         "raw_reference": _raw_reference(),
@@ -93,11 +163,101 @@ def _admit(**overrides):
         "source_package": FICTIONAL_SOURCE_PACKAGE,
         "source_package_version": FICTIONAL_SOURCE_PACKAGE_VERSION,
         "formatter_shape_id": FICTIONAL_FORMATTER_SHAPE_ID,
-        "result_container_type": FICTIONAL_RESULT_CONTAINER_TYPE,
-        "structured_content_result": _content(),
+        "result_container": result_container,
     }
     values.update(overrides)
-    return admit_formatted_snapshot(**values)
+    with patch.object(
+        admission_module,
+        "_MCP_CALL_TOOL_RESULT_TYPE",
+        CallToolResult,
+    ):
+        return admit_formatted_snapshot(**values)
+
+
+def _webull_content(**overrides):
+    # These values are deliberately fictional and were not reconstructed from
+    # the destroyed live witness.
+    values = {
+        "symbol": "SPY",
+        "price": "101.25",
+        "pre_close": "100.75",
+        "change": "0.50",
+        "change_ratio": "0.0049",
+        "open": "100.80",
+        "high": "102.00",
+        "low": "100.10",
+        "close": "101.25",
+        "volume": "123456",
+        "bid": "101.20",
+        "bid_size": "100",
+        "ask": "101.30",
+        "ask_size": "200",
+        "turnover": "1234567.89",
+        "eps": "12.34",
+        "eps_ttm": "11.95",
+        "lot_size": "1",
+        "bps": "45.67",
+    }
+    values.update(overrides)
+    return "\n".join(
+        (
+            WEBULL_MCP_US_DISCLAIMER_LINE,
+            "",
+            WEBULL_MCP_HEADER,
+            (
+                f"  {values['symbol']:>8s}  "
+                f"Price: {values['price']:>10s}  "
+                f"PreClose: {values['pre_close']:>10s}  "
+                f"Change: {values['change']:>8s}  "
+                f"Change%: {values['change_ratio']:>8s}"
+            ),
+            (
+                f"{'':>10s}  Open: {values['open']:>10s}  "
+                f"High: {values['high']:>10s}  "
+                f"Low: {values['low']:>10s}  "
+                f"Close: {values['close']:>10s}  "
+                f"Vol: {values['volume']:>12s}"
+            ),
+            (
+                f"{'':>10s}  Bid: {values['bid']:>10s} x "
+                f"{values['bid_size']:>6s}  Ask: {values['ask']:>10s} x "
+                f"{values['ask_size']:>6s}"
+            ),
+            (
+                f"{'':>10s}  Turnover: {values['turnover']:>12s}  "
+                f"EPS: {values['eps']:>8s}  "
+                f"EPS(TTM): {values['eps_ttm']:>8s}  "
+                f"Lot Size: {values['lot_size']:>6s}  "
+                f"BPS: {values['bps']:>8s}"
+            ),
+        )
+    )
+
+
+def _admit_webull(**overrides):
+    result_container = _legacy_result_overrides(
+        overrides,
+        default_content=_webull_content(),
+    )
+    values = {
+        "transport_receipt": _transport(),
+        "raw_reference": _raw_reference(),
+        "derivative_id": "derivative-webull-001",
+        "expected_symbol": "SPY",
+        "source_package": WEBULL_MCP_SOURCE_PACKAGE,
+        "source_package_version": WEBULL_MCP_SOURCE_PACKAGE_VERSION,
+        "formatter_shape_id": WEBULL_MCP_FORMATTER_SHAPE_ID,
+        "result_container": result_container,
+        "source_file_hashes": dict(WEBULL_MCP_SOURCE_FILE_HASHES),
+        "admitted_arguments": {"symbols": "SPY"},
+    }
+    values.update(overrides)
+    with patch.object(
+        admission_module,
+        "_MCP_CALL_TOOL_RESULT_TYPE",
+        CallToolResult,
+    ):
+        return admit_formatted_snapshot(**values)
 
 
 class TestArtifactBoundaries(TestCase):
@@ -188,7 +348,7 @@ class TestFictionalFormatterAdmission(TestCase):
         self.assertEqual(outcome.observed_at_source, "BROKER_EXPLICIT")
 
     def test_unknown_real_package_version_fails_closed(self):
-        outcome = _admit(source_package_version="1.1.6")
+        outcome = _admit(source_package_version="9.9.9")
         self.assertEqual(outcome.failure_class, "UNSUPPORTED_PACKAGE_VERSION")
 
     def test_unknown_formatter_shape_fails_closed(self):
@@ -196,7 +356,9 @@ class TestFictionalFormatterAdmission(TestCase):
         self.assertEqual(outcome.failure_class, "UNKNOWN_FORMATTER_SHAPE")
 
     def test_missing_structured_content_fails_closed(self):
-        outcome = _admit(structured_content_result=None)
+        outcome = _admit(
+            result_container=CallToolResult(structured_content=None),
+        )
         self.assertEqual(outcome.failure_class, "STRUCTURED_CONTENT_MISSING")
 
     def test_wrong_result_container_fails_closed(self):
@@ -294,6 +456,490 @@ class TestFictionalFormatterAdmission(TestCase):
         encoded = json.dumps(outcome.to_dict())
         self.assertNotIn("501.25", encoded)
         self.assertNotIn("SPY", encoded)
+
+
+class TestWebullMCP116FormatterContract(TestCase):
+    def test_admission_api_requires_original_envelope(self):
+        parameters = inspect.signature(admit_formatted_snapshot).parameters
+        self.assertIn("result_container", parameters)
+        self.assertNotIn("result_container_type", parameters)
+        self.assertNotIn("structured_content_result", parameters)
+
+    def test_original_mcp_type_import_failure_is_value_free(self):
+        with patch.object(
+            admission_module,
+            "_MCP_CALL_TOOL_RESULT_TYPE",
+            None,
+        ), patch(
+            "builtins.__import__",
+            side_effect=ImportError("fictional-sensitive-import-detail"),
+        ):
+            outcome = admit_formatted_snapshot(
+                transport_receipt=_transport(),
+                raw_reference=_raw_reference(),
+                derivative_id="derivative-webull-001",
+                expected_symbol="SPY",
+                source_package=WEBULL_MCP_SOURCE_PACKAGE,
+                source_package_version=WEBULL_MCP_SOURCE_PACKAGE_VERSION,
+                formatter_shape_id=WEBULL_MCP_FORMATTER_SHAPE_ID,
+                result_container=CallToolResult(
+                    structured_content={"result": _webull_content()},
+                ),
+                source_file_hashes=dict(WEBULL_MCP_SOURCE_FILE_HASHES),
+                admitted_arguments={"symbols": "SPY"},
+            )
+        self.assertEqual(outcome.failure_class, "RESULT_CONTAINER_MISSING")
+        self.assertNotIn(
+            "fictional-sensitive-import-detail",
+            json.dumps(outcome.to_dict()),
+        )
+        self.assertFalse(outcome.execution_authority)
+
+    def test_original_envelope_path_is_exact(self):
+        missing_attribute = CallToolResult(
+            structured_content=_MISSING,
+            is_error=False,
+        )
+        self.assertEqual(
+            _admit_webull(result_container=missing_attribute).failure_class,
+            "STRUCTURED_CONTENT_MISSING",
+        )
+
+        cases = (
+            (CallToolResult(structured_content=None), "STRUCTURED_CONTENT_MISSING"),
+            (CallToolResult(structured_content=[]), "VALUE_TYPE_INVALID"),
+            (CallToolResult(structured_content={}), "RESULT_CONTAINER_MISSING"),
+            (
+                CallToolResult(structured_content={"result": ["not-text"]}),
+                "VALUE_TYPE_INVALID",
+            ),
+            (
+                CallToolResult(
+                    structured_content={"result": _webull_content(), "data": "alias"}
+                ),
+                "AMBIGUOUS_FIELD",
+            ),
+            (
+                CallToolResult(
+                    structured_content={"result": _webull_content()},
+                    is_error=True,
+                ),
+                "RESULT_CONTAINER_MISSING",
+            ),
+            (
+                CallToolResult(
+                    structured_content={"result": _webull_content()},
+                    is_error=None,
+                ),
+                "VALUE_TYPE_INVALID",
+            ),
+        )
+        for envelope, failure_class in cases:
+            with self.subTest(failure_class=failure_class):
+                outcome = _admit_webull(result_container=envelope)
+                self.assertEqual(outcome.failure_class, failure_class)
+                self.assertFalse(outcome.execution_authority)
+
+        lookalike_type = type("CallToolResult", (), {})
+        lookalike_type.__module__ = "mcp.types"
+        lookalike = lookalike_type()
+        lookalike.structuredContent = {"result": _webull_content()}
+        lookalike.isError = False
+        self.assertEqual(
+            _admit_webull(result_container=lookalike).failure_class,
+            "RESULT_CONTAINER_MISSING",
+        )
+
+    def test_envelope_aliases_are_refused(self):
+        structured_alias = CallToolResult(
+            structured_content={"result": _webull_content()},
+        )
+        structured_alias.structured_content = {"result": _webull_content()}
+        self.assertEqual(
+            _admit_webull(result_container=structured_alias).failure_class,
+            "AMBIGUOUS_FIELD",
+        )
+
+        error_alias = CallToolResult(
+            structured_content={"result": _webull_content()},
+        )
+        error_alias.is_error = False
+        self.assertEqual(
+            _admit_webull(result_container=error_alias).failure_class,
+            "AMBIGUOUS_FIELD",
+        )
+
+        for alias_name in ("result", "data", "structured_content_result"):
+            with self.subTest(alias_name=alias_name):
+                top_level_alias = CallToolResult(
+                    structured_content={"result": _webull_content()},
+                )
+                setattr(top_level_alias, alias_name, _webull_content())
+                self.assertEqual(
+                    _admit_webull(result_container=top_level_alias).failure_class,
+                    "AMBIGUOUS_FIELD",
+                )
+
+        extra_container = CallToolResult(
+            structured_content={"result": _webull_content()},
+        )
+        extra_container.model_extra = {"alternate": _webull_content()}
+        self.assertEqual(
+            _admit_webull(result_container=extra_container).failure_class,
+            "AMBIGUOUS_FIELD",
+        )
+
+    def test_external_text_and_meta_cannot_substitute_for_structured_result(self):
+        no_structured_result = CallToolResult(
+            structured_content={},
+            content=[_webull_content()],
+            meta={"result": _webull_content()},
+        )
+        outcome = _admit_webull(result_container=no_structured_result)
+        self.assertEqual(outcome.failure_class, "RESULT_CONTAINER_MISSING")
+
+        authoritative_structured_result = CallToolResult(
+            structured_content={"result": _webull_content()},
+            content=["non-authoritative text"],
+            meta={"result": "non-authoritative metadata"},
+        )
+        admitted = _admit_webull(result_container=authoritative_structured_result)
+        self.assertIsInstance(admitted, ScrubbedSnapshotDerivative)
+
+    def test_absent_error_flag_is_permitted_but_fastmcp_wrapper_is_not(self):
+        no_error_attribute = CallToolResult(
+            structured_content={"result": _webull_content()},
+            is_error=_MISSING,
+        )
+        self.assertIsInstance(
+            _admit_webull(result_container=no_error_attribute),
+            ScrubbedSnapshotDerivative,
+        )
+
+        fastmcp_alias_type = type("CallToolResult", (), {})
+        fastmcp_alias_type.__module__ = "mcp.types"
+        fastmcp_alias = fastmcp_alias_type()
+        fastmcp_alias.structured_content = {"result": _webull_content()}
+        fastmcp_alias.is_error = False
+        self.assertEqual(
+            _admit_webull(result_container=fastmcp_alias).failure_class,
+            "RESULT_CONTAINER_MISSING",
+        )
+
+    def test_exact_fictional_seven_line_shape_creates_pending_candidate(self):
+        outcome = _admit_webull()
+        self.assertIsInstance(outcome, ScrubbedSnapshotDerivative)
+        self.assertEqual(outcome.source_package_version, "1.1.6")
+        self.assertEqual(outcome.formatter_shape_id, WEBULL_MCP_FORMATTER_SHAPE_ID)
+        self.assertEqual(outcome.instrument_symbol, "SPY")
+        self.assertEqual(
+            dict(outcome.market_fields),
+            {
+                "last_price": "101.25",
+                "bid": "101.20",
+                "ask": "101.30",
+                "spread": "0.10",
+                "volume": "123456",
+            },
+        )
+        self.assertIsNone(outcome.observed_at)
+        self.assertEqual(outcome.observed_at_source, "UNAVAILABLE")
+        self.assertEqual(outcome.human_review_status, "PENDING")
+        self.assertFalse(outcome.fixture_admitted)
+        self.assertFalse(outcome.execution_authority)
+
+    def test_source_hash_identity_is_exact_and_fail_closed(self):
+        missing = _admit_webull(source_file_hashes=None)
+        self.assertEqual(missing.failure_class, "SOURCE_HASH_MISMATCH")
+
+        changed = dict(WEBULL_MCP_SOURCE_FILE_HASHES)
+        changed["formatters.py"] = "0" * 64
+        mismatch = _admit_webull(source_file_hashes=changed)
+        self.assertEqual(mismatch.failure_class, "SOURCE_HASH_MISMATCH")
+
+        extra = dict(WEBULL_MCP_SOURCE_FILE_HASHES)
+        extra["unreviewed.py"] = "0" * 64
+        broader = _admit_webull(source_file_hashes=extra)
+        self.assertEqual(broader.failure_class, "SOURCE_HASH_MISMATCH")
+
+    def test_invocation_contract_requires_exact_symbols_string(self):
+        for arguments in (
+            None,
+            {"symbols": ["SPY"]},
+            {"symbol": "SPY"},
+            {"symbols": "SPY", "category": "US_STOCK"},
+            {"symbols": "QQQ"},
+        ):
+            with self.subTest(arguments=arguments):
+                outcome = _admit_webull(admitted_arguments=arguments)
+                self.assertEqual(outcome.failure_class, "FIELD_LAYOUT_MISMATCH")
+
+    def test_custody_inputs_are_not_mutated_or_retained(self):
+        hashes = dict(WEBULL_MCP_SOURCE_FILE_HASHES)
+        arguments = {"symbols": "SPY"}
+        original_hashes = dict(hashes)
+        original_arguments = dict(arguments)
+        outcome = _admit_webull(
+            source_file_hashes=hashes,
+            admitted_arguments=arguments,
+        )
+        self.assertIsInstance(outcome, ScrubbedSnapshotDerivative)
+        self.assertEqual(hashes, original_hashes)
+        self.assertEqual(arguments, original_arguments)
+        encoded = json.dumps(outcome.to_dict())
+        self.assertNotIn("b58d4bda", encoded)
+        self.assertNotIn('"symbols"', encoded)
+        self.assertNotIn(WEBULL_MCP_US_DISCLAIMER_LINE, encoded)
+
+    def test_package_version_shape_and_result_container_are_exact(self):
+        unsupported_version = _admit_webull(source_package_version="1.1.7")
+        self.assertEqual(
+            unsupported_version.failure_class,
+            "UNSUPPORTED_PACKAGE_VERSION",
+        )
+        unsupported_shape = _admit_webull(formatter_shape_id="other.shape")
+        self.assertEqual(unsupported_shape.failure_class, "UNKNOWN_FORMATTER_SHAPE")
+        wrong_container = _admit_webull(result_container_type="dict")
+        self.assertEqual(wrong_container.failure_class, "RESULT_CONTAINER_MISSING")
+
+    def test_disclaimer_header_and_separator_are_exact(self):
+        changed_disclaimer = _webull_content().replace(
+            WEBULL_MCP_US_DISCLAIMER_LINE,
+            "Different disclaimer",
+            1,
+        )
+        self.assertEqual(
+            _admit_webull(
+                structured_content_result=changed_disclaimer
+            ).failure_class,
+            "DISCLAIMER_MISMATCH",
+        )
+
+        changed_separator = _webull_content().replace("\n\n", "\nnot-empty\n", 1)
+        self.assertEqual(
+            _admit_webull(
+                structured_content_result=changed_separator
+            ).failure_class,
+            "DISCLAIMER_MISMATCH",
+        )
+
+        changed_header = _webull_content().replace(
+            WEBULL_MCP_HEADER,
+            "=== Other Snapshot ===",
+            1,
+        )
+        self.assertEqual(
+            _admit_webull(structured_content_result=changed_header).failure_class,
+            "FIELD_LAYOUT_MISMATCH",
+        )
+
+    def test_line_count_and_order_fail_closed(self):
+        lines = _webull_content().split("\n")
+        base_only = "\n".join(lines[:-1])
+        self.assertEqual(
+            _admit_webull(structured_content_result=base_only).failure_class,
+            "LINE_COUNT_MISMATCH",
+        )
+
+        reordered = list(lines)
+        reordered[4], reordered[5] = reordered[5], reordered[4]
+        self.assertEqual(
+            _admit_webull(structured_content_result="\n".join(reordered)).failure_class,
+            "FIELD_LAYOUT_MISMATCH",
+        )
+
+        trailing = _webull_content() + "\n"
+        self.assertEqual(
+            _admit_webull(structured_content_result=trailing).failure_class,
+            "LINE_COUNT_MISMATCH",
+        )
+
+    def test_extended_and_overnight_sections_are_not_admitted(self):
+        lines = _webull_content().split("\n")
+        extended = list(lines)
+        extended[-1] = (
+            f"{'':>10s}  ExtHr Price: {'101.40':>10s}  High: {'102.00':>10s}  "
+            f"Low: {'100.00':>10s}  Change: {'0.15':>8s} ({'0.0015'})  "
+            f"Vol: {'500':>12s}"
+        )
+        self.assertEqual(
+            _admit_webull(structured_content_result="\n".join(extended)).failure_class,
+            "OPTIONAL_SECTION_UNSUPPORTED",
+        )
+
+        overnight = _webull_content() + (
+            "\n" + f"{'':>10s}  OVN Price: {'101.10':>10s}"
+        )
+        self.assertEqual(
+            _admit_webull(structured_content_result=overnight).failure_class,
+            "OPTIONAL_SECTION_UNSUPPORTED",
+        )
+
+    def test_multiple_symbol_blocks_are_refused(self):
+        lines = _webull_content().split("\n")
+        second_block = lines[3:6]
+        multi = "\n".join((*lines[:-1], *second_block, lines[-1]))
+        outcome = _admit_webull(structured_content_result=multi)
+        self.assertEqual(outcome.failure_class, "MULTI_SYMBOL_RESPONSE")
+
+    def test_symbol_match_is_exact(self):
+        outcome = _admit_webull(structured_content_result=_webull_content(symbol="QQQ"))
+        self.assertEqual(outcome.failure_class, "SYMBOL_MISMATCH")
+
+    def test_required_market_values_cannot_be_missing(self):
+        for field in ("price", "bid", "ask", "volume"):
+            with self.subTest(field=field):
+                outcome = _admit_webull(
+                    structured_content_result=_webull_content(**{field: "N/A"})
+                )
+                self.assertEqual(outcome.failure_class, "REQUIRED_FIELD_MISSING")
+
+    def test_all_formatter_numeric_fields_are_validated(self):
+        cases = (
+            {"price": "NaN"},
+            {"bid": "-1"},
+            {"bid": "102", "ask": "101"},
+            {"volume": "1.5"},
+            {"pre_close": "not-a-number"},
+            {"bid_size": "1.5"},
+            {"turnover": "Infinity"},
+            {"lot_size": "1.5"},
+        )
+        for values in cases:
+            with self.subTest(values=values):
+                outcome = _admit_webull(
+                    structured_content_result=_webull_content(**values)
+                )
+                self.assertEqual(outcome.failure_class, "VALUE_TYPE_INVALID")
+
+    def test_nonadmitted_na_values_remain_categorical(self):
+        outcome = _admit_webull(
+            structured_content_result=_webull_content(
+                pre_close="N/A",
+                change="N/A",
+                bid_size="N/A",
+                eps="N/A",
+            )
+        )
+        self.assertIsInstance(outcome, ScrubbedSnapshotDerivative)
+        self.assertEqual(
+            outcome.null_field_names,
+            ("bid_size", "change", "eps", "pre_close"),
+        )
+        self.assertNotIn("pre_close", outcome.market_fields)
+        self.assertIn(
+            "pre_close",
+            outcome.recognized_but_not_admitted_field_names,
+        )
+
+    def test_empty_fundamentals_candidate_is_impossible_for_this_shape(self):
+        outcome = _admit_webull(
+            structured_content_result=_webull_content(
+                turnover="N/A",
+                eps="N/A",
+                eps_ttm="N/A",
+                lot_size="N/A",
+                bps="N/A",
+            )
+        )
+        self.assertEqual(outcome.failure_class, "FIELD_LAYOUT_MISMATCH")
+
+    def test_secret_scan_covers_every_sealed_marker_class(self):
+        markers = (
+            "app_key=fictional-sensitive-value",
+            "webull_app_key_id=fictional-sensitive-value",
+            "app key: fictional-sensitive-value",
+            "app-secret=fictional-sensitive-value",
+            "app secret: fictional-sensitive-value",
+            "Bearer fictional-sensitive-value",
+            "Bearer: fictional-sensitive-value",
+            "bearer_token=fictional-sensitive-value",
+            "access_token=fictional-sensitive-value",
+            "access token: fictional-sensitive-value",
+            "refresh-token=fictional-sensitive-value",
+            "refresh token: fictional-sensitive-value",
+            "authorization=fictional-sensitive-value",
+            "signature=fictional-sensitive-value",
+            "x-sign=fictional-sensitive-value",
+        )
+        for marker in markers:
+            with self.subTest(marker_class=marker.split("=")[0]):
+                outcome = _admit_webull(
+                    structured_content_result=_webull_content(eps=marker)
+                )
+                encoded = json.dumps(outcome.to_dict())
+                self.assertEqual(outcome.failure_class, "SECRET_PATTERN_PRESENT")
+                self.assertNotIn("fictional-sensitive-value", encoded)
+                self.assertFalse(outcome.execution_authority)
+
+    def test_identity_scan_covers_every_sealed_marker_class(self):
+        markers = (
+            "account_id=fictional-sensitive-value",
+            "account-number=fictional-sensitive-value",
+            "account id: fictional-sensitive-value",
+            "request_id=fictional-sensitive-value",
+            "request id: fictional-sensitive-value",
+            "trace-identifier=fictional-sensitive-value",
+            "trace identifier: fictional-sensitive-value",
+            "session_id=fictional-sensitive-value",
+            "session-identifier=fictional-sensitive-value",
+            "session id: fictional-sensitive-value",
+            "profile_path=/fictional-sensitive-value",
+            "profile path: /fictional-sensitive-value",
+            "/profiles/fictional-sensitive-value",
+            "/Users/fictional-sensitive-value",
+            "/home/fictional-sensitive-value",
+            "~/fictional-sensitive-value",
+            r"C:\Users\fictional-sensitive-value",
+            "HOME=/fictional-sensitive-value",
+            r"USERPROFILE=C:\fictional-sensitive-value",
+        )
+        for marker in markers:
+            with self.subTest(marker_class=marker.split("=")[0]):
+                outcome = _admit_webull(
+                    structured_content_result=_webull_content(eps=marker)
+                )
+                encoded = json.dumps(outcome.to_dict())
+                self.assertEqual(outcome.failure_class, "IDENTITY_PATTERN_PRESENT")
+                self.assertNotIn("fictional-sensitive-value", encoded)
+                self.assertFalse(outcome.execution_authority)
+
+    def test_secret_scan_precedes_source_identity_validation(self):
+        outcome = _admit_webull(
+            source_file_hashes={"formatters.py": "0" * 64},
+            structured_content_result="access_token=fictional-sensitive-value",
+        )
+        self.assertEqual(outcome.failure_class, "SECRET_PATTERN_PRESENT")
+        self.assertNotIn("fictional-sensitive-value", json.dumps(outcome.to_dict()))
+
+    def test_real_derivative_is_value_free_outside_admitted_fields(self):
+        outcome = _admit_webull()
+        self.assertIsInstance(outcome, ScrubbedSnapshotDerivative)
+        encoded = json.dumps(outcome.to_dict())
+        self.assertNotIn("PreClose:", encoded)
+        self.assertNotIn("Turnover:", encoded)
+        self.assertNotIn("1234567.89", encoded)
+        self.assertNotIn("raw_content", encoded)
+        self.assertFalse(outcome.execution_authority)
+
+    def test_real_candidate_can_be_human_registered_without_fixture_authority(self):
+        candidate = _admit_webull()
+        approved = register_human_approved_derivative(
+            candidate,
+            human_review_authorized=True,
+        )
+        self.assertIsInstance(approved, ScrubbedSnapshotDerivative)
+        self.assertEqual(approved.human_review_status, "APPROVED")
+        self.assertEqual(len(approved.sha256_registration), 64)
+        self.assertFalse(approved.fixture_admitted)
+        self.assertFalse(approved.execution_authority)
+
+    def test_invalid_transport_stops_before_formatter_admission(self):
+        outcome = _admit_webull(
+            transport_receipt=_transport(broker_requests_executed=0),
+            structured_content_result="access_token=must-not-be-parsed",
+        )
+        self.assertEqual(outcome.failure_class, "TRANSPORT_RECEIPT_INVALID")
 
 
 class TestHumanReviewAndHashing(TestCase):
