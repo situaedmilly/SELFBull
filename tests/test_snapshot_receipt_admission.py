@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -34,6 +35,43 @@ from selfbull.snapshot_receipt_admission import (  # noqa: E402
 
 _MISSING = object()
 
+_GENERIC_SECRET_IDENTIFIER_MARKERS = (
+    "token:fictional-sensitive-value",
+    "api-token:fictional-sensitive-value",
+    "api_token:fictional-sensitive-value",
+    "secret:fictional-sensitive-value",
+    "client-secret:fictional-sensitive-value",
+    "client_secret:fictional-sensitive-value",
+    "credential:fictional-sensitive-value",
+    "credentials:fictional-sensitive-value",
+    "service-credential:fictional-sensitive-value",
+    "service_credential:fictional-sensitive-value",
+    "password:fictional-sensitive-value",
+    "user-password:fictional-sensitive-value",
+    "user_password:fictional-sensitive-value",
+)
+
+_GENERIC_SECRET_CONTENT_MARKERS = (
+    "token: fictional-sensitive-value",
+    "token=fictional-sensitive-value",
+    "api token: fictional-sensitive-value",
+    "api-token=fictional-sensitive-value",
+    "api_token = fictional-sensitive-value",
+    "secret: fictional-sensitive-value",
+    "client secret=fictional-sensitive-value",
+    "client-secret: fictional-sensitive-value",
+    "client_secret = fictional-sensitive-value",
+    "credential: fictional-sensitive-value",
+    "credentials=fictional-sensitive-value",
+    "service credential: fictional-sensitive-value",
+    "service-credential=fictional-sensitive-value",
+    "service_credential = fictional-sensitive-value",
+    "password: fictional-sensitive-value",
+    "user password=fictional-sensitive-value",
+    "user-password: fictional-sensitive-value",
+    "user_password = fictional-sensitive-value",
+)
+
 
 class CallToolResult:
     """Offline model of the original low-level MCP result envelope."""
@@ -55,6 +93,133 @@ class CallToolResult:
 
 
 CallToolResult.__module__ = "mcp.types"
+
+
+class HostileAttributeObject:
+    """Object whose sensitive attributes must never be inspected or rendered."""
+
+    def __init__(self):
+        object.__setattr__(self, "access_count", 0)
+
+    def __getattribute__(self, name):
+        if name in {
+            "transport_receipt_id",
+            "raw_reference_id",
+            "capture_session_id",
+            "derivative_id",
+            "revision_of",
+            "fixture_id",
+            "parser_version",
+            "schema_version",
+            "instrument_symbol",
+            "source_package",
+            "source_package_version",
+            "formatter_shape_id",
+            "human_review_status",
+            "sha256_registration",
+        }:
+            count = object.__getattribute__(self, "access_count")
+            object.__setattr__(self, "access_count", count + 1)
+            raise RuntimeError("hostile attribute detail")
+        return object.__getattribute__(self, name)
+
+    def __repr__(self):
+        raise RuntimeError("hostile repr detail")
+
+    def __str__(self):
+        raise RuntimeError("hostile str detail")
+
+
+class HostileTrustedEnvelope:
+    """Trusted-type test double with one controlled hostile property."""
+
+    def __init__(self, exception):
+        self.exception = exception
+        self.access_count = 0
+
+    @property
+    def structuredContent(self):
+        self.access_count += 1
+        raise self.exception
+
+
+class SelectiveHostileTrustedEnvelope:
+    """Raises on exactly one named envelope property and nowhere else."""
+
+    _ALIASES = frozenset(
+        {
+            "structured_content",
+            "is_error",
+            "result",
+            "data",
+            "structured_content_result",
+        }
+    )
+
+    def __init__(self, *, target, exception, formatter_result):
+        object.__setattr__(self, "target", target)
+        object.__setattr__(self, "exception", exception)
+        object.__setattr__(self, "formatter_result", formatter_result)
+        object.__setattr__(self, "access_count", 0)
+
+    def __getattribute__(self, name):
+        target = object.__getattribute__(self, "target")
+        if name == target:
+            count = object.__getattribute__(self, "access_count")
+            object.__setattr__(self, "access_count", count + 1)
+            raise object.__getattribute__(self, "exception")
+        if name == "structuredContent":
+            return {
+                "result": object.__getattribute__(self, "formatter_result"),
+            }
+        if name == "isError":
+            return False
+        if name == "model_extra":
+            return None
+        if name in object.__getattribute__(self, "_ALIASES"):
+            raise AttributeError(name)
+        return object.__getattribute__(self, name)
+
+    def __repr__(self):
+        raise RuntimeError("hostile envelope repr detail")
+
+    def __str__(self):
+        raise RuntimeError("hostile envelope str detail")
+
+
+class HostileIdentityValue:
+    """A non-string value that refuses coercion, comparison, and rendering."""
+
+    def __init__(self):
+        self.access_count = 0
+
+    def _refuse(self):
+        self.access_count += 1
+        raise RuntimeError("hostile identity detail")
+
+    def __eq__(self, other):
+        return self._refuse()
+
+    def __hash__(self):
+        return self._refuse()
+
+    def __repr__(self):
+        return self._refuse()
+
+    def __str__(self):
+        return self._refuse()
+
+
+class CustomHostileEnvelopeError(Exception):
+    """Local ordinary exception used by hostile property probes."""
+
+
+class NestedHostileEnvelopeError(Exception):
+    """Python-3.9-compatible grouped ordinary exception representation."""
+
+    def __init__(self, message, exceptions):
+        super().__init__(message)
+        self.exceptions = tuple(exceptions)
 
 
 def _result_container(
@@ -317,6 +482,64 @@ class TestArtifactBoundaries(TestCase):
         with self.assertRaises(FrozenInstanceError):
             _raw_reference().raw_destroyed = False  # type: ignore[misc]
 
+    def test_privacy_markers_are_never_valid_artifact_identifiers(self):
+        markers = (
+            "app-key-fictional-sensitive-value",
+            "app-secret-fictional-sensitive-value",
+            "bearer-token-fictional-sensitive-value",
+            "access-token-fictional-sensitive-value",
+            "refresh-token-fictional-sensitive-value",
+            "authorization-fictional-sensitive-value",
+            "signature-fictional-sensitive-value",
+            "x-sign-fictional-sensitive-value",
+            "account-id-fictional-sensitive-value",
+            "account-number-fictional-sensitive-value",
+            "request-id-fictional-sensitive-value",
+            "trace-identifier-fictional-sensitive-value",
+            "session-id-fictional-sensitive-value",
+            "profile-path-fictional-sensitive-value",
+            "/Users/fictional-sensitive-value",
+            "/home/fictional-sensitive-value",
+            "~/fictional-sensitive-value",
+            r"C:\Users\fictional-sensitive-value",
+            "HOME=/fictional-sensitive-value",
+            r"USERPROFILE=C:\fictional-sensitive-value",
+        ) + _GENERIC_SECRET_IDENTIFIER_MARKERS
+        for case_index, marker in enumerate(markers):
+            with self.subTest(case_index=case_index):
+                self.assertFalse(admission_module._is_safe_identifier(marker))
+                self.assertEqual(
+                    admission_module._safe_identifier(marker),
+                    "UNAVAILABLE",
+                )
+                self.assertFalse(admission_module._is_safe_symbol(marker))
+                transport = _transport(transport_receipt_id=marker)
+                raw_reference = _raw_reference(raw_reference_id=marker)
+                capture_transport = _transport(capture_session_id=marker)
+                capture_reference = _raw_reference(capture_session_id=marker)
+                self.assertFalse(transport.valid_for_snapshot_admission())
+                self.assertFalse(raw_reference.valid_for_snapshot_admission())
+                self.assertFalse(capture_transport.valid_for_snapshot_admission())
+                self.assertFalse(capture_reference.valid_for_snapshot_admission())
+                with self.assertRaises(ValueError):
+                    transport.to_dict()
+                with self.assertRaises(ValueError):
+                    raw_reference.to_dict()
+
+    def test_fixture_and_parser_identities_are_not_caller_supplied(self):
+        raw_parameters = inspect.signature(RawWitnessReference).parameters
+        derivative_parameters = inspect.signature(ScrubbedSnapshotDerivative).parameters
+        self.assertNotIn("fixture_id", raw_parameters)
+        self.assertNotIn("parser_version", derivative_parameters)
+        self.assertNotIn("schema_version", derivative_parameters)
+        for identity in (
+            admission_module.PARSER_VERSION,
+            WEBULL_MCP_SOURCE_PACKAGE,
+            WEBULL_MCP_SOURCE_PACKAGE_VERSION,
+            WEBULL_MCP_FORMATTER_SHAPE_ID,
+        ):
+            self.assertTrue(admission_module._is_safe_identifier(identity))
+
 
 class TestFictionalFormatterAdmission(TestCase):
     def test_valid_fictional_content_creates_candidate(self):
@@ -457,6 +680,152 @@ class TestFictionalFormatterAdmission(TestCase):
         self.assertNotIn("501.25", encoded)
         self.assertNotIn("SPY", encoded)
 
+    def test_hostile_receipt_properties_are_never_evaluated(self):
+        hostile_transport = HostileAttributeObject()
+        transport_outcome = _admit(transport_receipt=hostile_transport)
+        self.assertEqual(
+            transport_outcome.failure_class,
+            "TRANSPORT_RECEIPT_INVALID",
+        )
+        self.assertEqual(hostile_transport.access_count, 0)
+
+        hostile_reference = HostileAttributeObject()
+        reference_outcome = _admit(raw_reference=hostile_reference)
+        self.assertEqual(reference_outcome.failure_class, "RAW_REFERENCE_INVALID")
+        self.assertEqual(hostile_reference.access_count, 0)
+
+    def test_hostile_identity_objects_are_not_coerced_compared_or_rendered(self):
+        hostile_identity = HostileIdentityValue()
+        outcome = admit_formatted_snapshot(
+            transport_receipt=object(),
+            raw_reference=object(),
+            derivative_id="derivative-001",
+            expected_symbol="SPY",
+            source_package=hostile_identity,
+            source_package_version=hostile_identity,
+            formatter_shape_id=hostile_identity,
+            result_container=object(),
+        )
+        self.assertEqual(outcome.failure_class, "TRANSPORT_RECEIPT_INVALID")
+        self.assertEqual(outcome.source_package, "UNSUPPORTED")
+        self.assertEqual(outcome.source_package_version, "UNSUPPORTED")
+        self.assertEqual(outcome.formatter_shape_id, "UNSUPPORTED")
+        self.assertEqual(hostile_identity.access_count, 0)
+
+        valid_boundary_hostile = HostileIdentityValue()
+        valid_boundary_outcome = _admit(source_package=valid_boundary_hostile)
+        self.assertEqual(
+            valid_boundary_outcome.failure_class,
+            "UNSUPPORTED_PACKAGE_VERSION",
+        )
+        self.assertEqual(valid_boundary_outcome.source_package, "UNSUPPORTED")
+        self.assertEqual(valid_boundary_hostile.access_count, 0)
+
+    def test_privacy_identifiers_are_sanitized_from_refusals(self):
+        markers = (
+            "access-token-fictional-sensitive-value",
+        ) + _GENERIC_SECRET_IDENTIFIER_MARKERS
+        for case_index, marker in enumerate(markers):
+            with self.subTest(case_index=case_index):
+                transport_outcome = _admit(
+                    transport_receipt=_transport(transport_receipt_id=marker),
+                )
+                self.assertEqual(
+                    transport_outcome.failure_class,
+                    "TRANSPORT_RECEIPT_INVALID",
+                )
+                self.assertEqual(transport_outcome.transport_receipt_id, "UNAVAILABLE")
+
+                raw_outcome = _admit(
+                    raw_reference=_raw_reference(raw_reference_id=marker),
+                )
+                self.assertEqual(raw_outcome.failure_class, "RAW_REFERENCE_INVALID")
+                self.assertEqual(raw_outcome.raw_reference_id, "UNAVAILABLE")
+
+                derivative_outcome = _admit(derivative_id=marker)
+                self.assertEqual(derivative_outcome.failure_class, "VALUE_TYPE_INVALID")
+                revision_outcome = _admit(revision_of=marker)
+                self.assertEqual(revision_outcome.failure_class, "VALUE_TYPE_INVALID")
+
+                formatter_outcome = _admit(formatter_shape_id=marker)
+                self.assertEqual(
+                    formatter_outcome.failure_class,
+                    "UNKNOWN_FORMATTER_SHAPE",
+                )
+                self.assertEqual(formatter_outcome.formatter_shape_id, "UNSUPPORTED")
+
+                version_outcome = _admit(source_package_version=marker)
+                self.assertEqual(
+                    version_outcome.failure_class,
+                    "UNSUPPORTED_PACKAGE_VERSION",
+                )
+                self.assertEqual(version_outcome.source_package_version, "UNSUPPORTED")
+
+                package_outcome = _admit(source_package=marker)
+                self.assertEqual(
+                    package_outcome.failure_class,
+                    "UNSUPPORTED_PACKAGE_VERSION",
+                )
+                self.assertEqual(package_outcome.source_package, "UNSUPPORTED")
+
+        symbol_marker = "account-id-fictional-sensitive-value"
+        symbol_outcome = _admit(
+            expected_symbol=symbol_marker,
+            structured_content_result=_content(symbol=symbol_marker),
+        )
+        self.assertEqual(symbol_outcome.failure_class, "IDENTITY_PATTERN_PRESENT")
+
+    def test_direct_refusal_rejects_privacy_bearing_identifier_fields(self):
+        markers = (
+            "request-id-fictional-sensitive-value",
+        ) + _GENERIC_SECRET_IDENTIFIER_MARKERS
+        for case_index, marker in enumerate(markers):
+            for field_name in ("raw_reference_id", "transport_receipt_id"):
+                values = {
+                    "failure_class": "PARSER_INTERNAL_ERROR",
+                    "source_package": "UNSUPPORTED",
+                    "source_package_version": "UNSUPPORTED",
+                    "formatter_shape_id": "UNSUPPORTED",
+                    "raw_reference_id": "raw-reference-001",
+                    "transport_receipt_id": "transport-001",
+                }
+                values[field_name] = marker
+                with self.subTest(
+                    case_index=case_index,
+                    field_name=field_name,
+                ), self.assertRaises(ValueError):
+                    AdmissionRefusal(**values)
+
+    def test_generic_secret_scanner_remains_label_aware(self):
+        safe_texts = (
+            "token count",
+            "secret market status",
+            "credential policy",
+            "passwordless",
+            "market_token",
+            "secretary: value",
+        )
+        for case_index, safe_text in enumerate(safe_texts):
+            with self.subTest(case_index=case_index):
+                self.assertIsNone(admission_module._SECRET_PATTERN.search(safe_text))
+
+    def test_private_refusal_never_evaluates_hostile_identifier_values(self):
+        hostile = HostileIdentityValue()
+        outcome = admission_module._refusal(
+            "PARSER_INTERNAL_ERROR",
+            source_package=hostile,
+            source_package_version=hostile,
+            formatter_shape_id=hostile,
+            raw_reference_id=hostile,
+            transport_receipt_id=hostile,
+        )
+        self.assertEqual(outcome.raw_reference_id, "UNAVAILABLE")
+        self.assertEqual(outcome.transport_receipt_id, "UNAVAILABLE")
+        self.assertEqual(outcome.source_package, "UNSUPPORTED")
+        self.assertEqual(outcome.source_package_version, "UNSUPPORTED")
+        self.assertEqual(outcome.formatter_shape_id, "UNSUPPORTED")
+        self.assertEqual(hostile.access_count, 0)
+
 
 class TestWebullMCP116FormatterContract(TestCase):
     def test_admission_api_requires_original_envelope(self):
@@ -494,6 +863,148 @@ class TestWebullMCP116FormatterContract(TestCase):
             json.dumps(outcome.to_dict()),
         )
         self.assertFalse(outcome.execution_authority)
+
+    def test_hostile_trusted_envelope_property_is_evaluated_once_and_controlled(self):
+        envelope = HostileTrustedEnvelope(RuntimeError("hostile envelope detail"))
+        with patch.object(
+            admission_module,
+            "_MCP_CALL_TOOL_RESULT_TYPE",
+            HostileTrustedEnvelope,
+        ):
+            outcome = admit_formatted_snapshot(
+                transport_receipt=_transport(),
+                raw_reference=_raw_reference(),
+                derivative_id="derivative-webull-001",
+                expected_symbol="SPY",
+                source_package=WEBULL_MCP_SOURCE_PACKAGE,
+                source_package_version=WEBULL_MCP_SOURCE_PACKAGE_VERSION,
+                formatter_shape_id=WEBULL_MCP_FORMATTER_SHAPE_ID,
+                result_container=envelope,
+                source_file_hashes=dict(WEBULL_MCP_SOURCE_FILE_HASHES),
+                admitted_arguments={"symbols": "SPY"},
+            )
+        self.assertEqual(outcome.failure_class, "RESULT_CONTAINER_MISSING")
+        self.assertEqual(envelope.access_count, 1)
+        self.assertNotIn("hostile", json.dumps(outcome.to_dict()))
+
+    def test_every_named_envelope_property_has_one_controlled_access(self):
+        property_names = (
+            "structuredContent",
+            "isError",
+            "structured_content",
+            "is_error",
+            "result",
+            "data",
+            "structured_content_result",
+            "model_extra",
+        )
+        for case_index, property_name in enumerate(property_names):
+            with self.subTest(case_index=case_index):
+                envelope = SelectiveHostileTrustedEnvelope(
+                    target=property_name,
+                    exception=RuntimeError("hostile envelope detail"),
+                    formatter_result=_webull_content(),
+                )
+                with patch.object(
+                    admission_module,
+                    "_MCP_CALL_TOOL_RESULT_TYPE",
+                    SelectiveHostileTrustedEnvelope,
+                ):
+                    outcome = admit_formatted_snapshot(
+                        transport_receipt=_transport(),
+                        raw_reference=_raw_reference(),
+                        derivative_id="derivative-webull-001",
+                        expected_symbol="SPY",
+                        source_package=WEBULL_MCP_SOURCE_PACKAGE,
+                        source_package_version=WEBULL_MCP_SOURCE_PACKAGE_VERSION,
+                        formatter_shape_id=WEBULL_MCP_FORMATTER_SHAPE_ID,
+                        result_container=envelope,
+                        source_file_hashes=dict(WEBULL_MCP_SOURCE_FILE_HASHES),
+                        admitted_arguments={"symbols": "SPY"},
+                    )
+                self.assertEqual(outcome.failure_class, "RESULT_CONTAINER_MISSING")
+                self.assertEqual(envelope.access_count, 1)
+                self.assertNotIn("hostile", json.dumps(outcome.to_dict()))
+
+    def test_hostile_content_and_meta_access_are_controlled_and_value_free(self):
+        exception_factories = (
+            lambda: RuntimeError("hostile non-authoritative detail"),
+            lambda: ValueError("hostile non-authoritative detail"),
+            lambda: TypeError("hostile non-authoritative detail"),
+            lambda: CustomHostileEnvelopeError(
+                "hostile non-authoritative detail"
+            ),
+            lambda: NestedHostileEnvelopeError(
+                "hostile non-authoritative detail",
+                [RuntimeError("nested hostile detail")],
+            ),
+        )
+        for property_index, property_name in enumerate(("content", "_meta")):
+            for exception_index, exception_factory in enumerate(exception_factories):
+                with self.subTest(
+                    property_index=property_index,
+                    exception_index=exception_index,
+                ):
+                    envelope = SelectiveHostileTrustedEnvelope(
+                        target=property_name,
+                        exception=exception_factory(),
+                        formatter_result=_webull_content(),
+                    )
+                    with patch.object(
+                        admission_module,
+                        "_MCP_CALL_TOOL_RESULT_TYPE",
+                        SelectiveHostileTrustedEnvelope,
+                    ):
+                        outcome = admit_formatted_snapshot(
+                            transport_receipt=_transport(),
+                            raw_reference=_raw_reference(),
+                            derivative_id="derivative-webull-001",
+                            expected_symbol="SPY",
+                            source_package=WEBULL_MCP_SOURCE_PACKAGE,
+                            source_package_version=WEBULL_MCP_SOURCE_PACKAGE_VERSION,
+                            formatter_shape_id=WEBULL_MCP_FORMATTER_SHAPE_ID,
+                            result_container=envelope,
+                            source_file_hashes=dict(WEBULL_MCP_SOURCE_FILE_HASHES),
+                            admitted_arguments={"symbols": "SPY"},
+                        )
+                    encoded = json.dumps(outcome.to_dict())
+                    self.assertEqual(
+                        outcome.failure_class,
+                        "RESULT_CONTAINER_MISSING",
+                    )
+                    self.assertEqual(envelope.access_count, 1)
+                    self.assertNotIn("hostile", encoded)
+                    self.assertNotIn("content", encoded)
+                    self.assertNotIn("_meta", encoded)
+                    self.assertFalse(outcome.execution_authority)
+
+    def test_control_flow_exceptions_propagate_from_envelope_access(self):
+        exception_types = (
+            KeyboardInterrupt,
+            SystemExit,
+            asyncio.CancelledError,
+        )
+        for case_index, exception_type in enumerate(exception_types):
+            with self.subTest(case_index=case_index):
+                envelope = HostileTrustedEnvelope(exception_type())
+                with patch.object(
+                    admission_module,
+                    "_MCP_CALL_TOOL_RESULT_TYPE",
+                    HostileTrustedEnvelope,
+                ), self.assertRaises(exception_type):
+                    admit_formatted_snapshot(
+                        transport_receipt=_transport(),
+                        raw_reference=_raw_reference(),
+                        derivative_id="derivative-webull-001",
+                        expected_symbol="SPY",
+                        source_package=WEBULL_MCP_SOURCE_PACKAGE,
+                        source_package_version=WEBULL_MCP_SOURCE_PACKAGE_VERSION,
+                        formatter_shape_id=WEBULL_MCP_FORMATTER_SHAPE_ID,
+                        result_container=envelope,
+                        source_file_hashes=dict(WEBULL_MCP_SOURCE_FILE_HASHES),
+                        admitted_arguments={"symbols": "SPY"},
+                    )
+                self.assertEqual(envelope.access_count, 1)
 
     def test_original_envelope_path_is_exact(self):
         missing_attribute = CallToolResult(
@@ -861,9 +1372,9 @@ class TestWebullMCP116FormatterContract(TestCase):
             "authorization=fictional-sensitive-value",
             "signature=fictional-sensitive-value",
             "x-sign=fictional-sensitive-value",
-        )
-        for marker in markers:
-            with self.subTest(marker_class=marker.split("=")[0]):
+        ) + _GENERIC_SECRET_CONTENT_MARKERS
+        for case_index, marker in enumerate(markers):
+            with self.subTest(case_index=case_index):
                 outcome = _admit_webull(
                     structured_content_result=_webull_content(eps=marker)
                 )
@@ -894,8 +1405,8 @@ class TestWebullMCP116FormatterContract(TestCase):
             "HOME=/fictional-sensitive-value",
             r"USERPROFILE=C:\fictional-sensitive-value",
         )
-        for marker in markers:
-            with self.subTest(marker_class=marker.split("=")[0]):
+        for case_index, marker in enumerate(markers):
+            with self.subTest(case_index=case_index):
                 outcome = _admit_webull(
                     structured_content_result=_webull_content(eps=marker)
                 )
@@ -950,6 +1461,17 @@ class TestHumanReviewAndHashing(TestCase):
             human_review_authorized=False,
         )
         self.assertEqual(outcome.failure_class, "HUMAN_REVIEW_REQUIRED")
+
+    def test_hostile_non_derivative_is_refused_without_property_access(self):
+        hostile = HostileAttributeObject()
+        outcome = register_human_approved_derivative(
+            hostile,
+            human_review_authorized=False,
+        )
+        self.assertEqual(outcome.failure_class, "HUMAN_REVIEW_REQUIRED")
+        self.assertEqual(outcome.raw_reference_id, "UNAVAILABLE")
+        self.assertEqual(outcome.transport_receipt_id, "UNAVAILABLE")
+        self.assertEqual(hostile.access_count, 0)
 
     def test_approved_derivative_gets_stable_non_self_referential_hash(self):
         candidate = _admit()

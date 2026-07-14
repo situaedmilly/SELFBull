@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 SCHEMA_VERSION = "004B.mcp-one-tool-composition.v1"
@@ -53,9 +53,9 @@ def _resolve(value: Any) -> Any:
 
 def _tool_name(tool: Any) -> str:
     name = getattr(tool, "name", None)
-    if not isinstance(name, str) or not name.strip():
+    if not isinstance(name, str) or not name or name != name.strip():
         raise CompositionError("Malformed tool inventory")
-    return name.strip()
+    return name
 
 
 def _tool_names(server: Any) -> tuple[str, ...]:
@@ -144,31 +144,77 @@ def _load_official_config() -> Any:
     return load_config()
 
 
+class _LowLevelLifecycleCapability:
+    """Minimal low-level capability required by the in-memory MCP harness."""
+
+    __slots__ = ("__run_callable", "__initialization_options_callable")
+
+    def __init__(
+        self,
+        *,
+        run: Callable[..., Any],
+        create_initialization_options: Callable[..., Any],
+    ) -> None:
+        self.__run_callable = run
+        self.__initialization_options_callable = create_initialization_options
+
+    def run(self, *args: Any, **kwargs: Any) -> Any:
+        return self.__run_callable(*args, **kwargs)
+
+    def create_initialization_options(self, *args: Any, **kwargs: Any) -> Any:
+        return self.__initialization_options_callable(*args, **kwargs)
+
+
+class _LifecycleServerCapability:
+    """Lifecycle-only view consumed by the canonical session harness."""
+
+    __slots__ = ("__lifespan_factory", "__low_level_server")
+
+    def __init__(
+        self,
+        *,
+        lifespan_manager: Callable[[], Any],
+        low_level_server: _LowLevelLifecycleCapability,
+    ) -> None:
+        self.__lifespan_factory = lifespan_manager
+        self.__low_level_server = low_level_server
+
+    def _lifespan_manager(self) -> Any:
+        return self.__lifespan_factory()
+
+    @property
+    def _mcp_server(self) -> _LowLevelLifecycleCapability:
+        return self.__low_level_server
+
+
+def _lifecycle_capability(server: Any) -> _LifecycleServerCapability:
+    lifespan_manager = getattr(server, "_lifespan_manager", None)
+    low_level_server = getattr(server, "_mcp_server", None)
+    run = getattr(low_level_server, "run", None)
+    create_initialization_options = getattr(
+        low_level_server,
+        "create_initialization_options",
+        None,
+    )
+    if not callable(lifespan_manager):
+        raise CompositionError("Server does not expose a lifecycle manager")
+    if not callable(run) or not callable(create_initialization_options):
+        raise CompositionError("Server does not expose a bounded low-level lifecycle")
+    return _LifecycleServerCapability(
+        lifespan_manager=lifespan_manager,
+        low_level_server=_LowLevelLifecycleCapability(
+            run=run,
+            create_initialization_options=create_initialization_options,
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class SnapshotOnlyServer:
-    """Read-only facade over the pruned official MCP server."""
+    """Lifecycle-only composition handle for the canonical MCP harness."""
 
-    _server: Any
+    _server: _LifecycleServerCapability = field(repr=False)
     receipt: CompositionReceipt
-
-    async def list_tools(self) -> tuple[str, ...]:
-        receipt = _validate_names(await _tool_names_async(self._server))
-        if not receipt.exact_surface_match:
-            raise CompositionError("Snapshot-only surface drift detected")
-        return receipt.visible_tool_names
-
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
-        receipt = _validate_names(await _tool_names_async(self._server))
-        if not receipt.exact_surface_match:
-            raise CompositionError("Snapshot-only surface drift detected")
-        if name not in INVOCATION_ALLOWLIST:
-            raise CompositionError(f"Tool not allowed: {name}")
-        if not hasattr(self._server, "call_tool"):
-            raise CompositionError("Server does not expose call_tool()")
-        result = self._server.call_tool(name, arguments)
-        if inspect.isawaitable(result):
-            return await result
-        return result
 
 
 def build_snapshot_only_server(
@@ -191,4 +237,7 @@ def build_snapshot_only_server(
     if not receipt.exact_surface_match:
         raise CompositionError("Snapshot-only surface validation failed")
 
-    return SnapshotOnlyServer(_server=server, receipt=receipt)
+    return SnapshotOnlyServer(
+        _server=_lifecycle_capability(server),
+        receipt=receipt,
+    )

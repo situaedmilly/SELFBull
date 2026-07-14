@@ -9,6 +9,7 @@ separately governed capture boundary; this module never performs that capture.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -148,6 +149,7 @@ _FORBIDDEN_VOCABULARY = re.compile(
 )
 _SECRET_PATTERN = re.compile(
     r"(?i)("
+    r"(?:^|[\s_-])(?:token|secret|credentials?|password)\b\s*[:=]|"
     r"\b(?:webull[\s_-]*)?app[\s_-]*key(?:[\s_-]*id)?\b|"
     r"\b(?:webull[\s_-]*)?app[\s_-]*secret\b|"
     r"\bbearer(?:[\s_-]*token\b|\s+|\s*[:=])|"
@@ -196,15 +198,42 @@ def _freeze_mapping(value: Mapping[str, Optional[str]]) -> Mapping[str, Optional
 
 
 def _is_safe_identifier(value: Any) -> bool:
-    return isinstance(value, str) and bool(_SAFE_IDENTIFIER.fullmatch(value))
+    return (
+        type(value) is str
+        and bool(_SAFE_IDENTIFIER.fullmatch(value))
+        and _SECRET_PATTERN.search(value) is None
+        and _IDENTITY_PATTERN.search(value) is None
+    )
 
 
 def _safe_identifier(value: Any) -> str:
     return value if _is_safe_identifier(value) else "UNAVAILABLE"
 
 
+def _is_exact_literal(value: Any, expected: str) -> bool:
+    return type(value) is str and value == expected
+
+
+def _is_exact_string_tuple(value: Any, expected: Tuple[str, ...]) -> bool:
+    return (
+        type(value) is tuple
+        and len(value) == len(expected)
+        and all(type(item) is str for item in value)
+        and value == expected
+    )
+
+
+def _is_safe_symbol(value: Any) -> bool:
+    return (
+        type(value) is str
+        and bool(_SAFE_SYMBOL.fullmatch(value))
+        and _SECRET_PATTERN.search(value) is None
+        and _IDENTITY_PATTERN.search(value) is None
+    )
+
+
 def _aware_iso8601(value: Any) -> Optional[datetime]:
-    if not isinstance(value, str) or not value:
+    if type(value) is not str or not value:
         return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -259,21 +288,36 @@ class TransportReceipt:
             (
                 _is_safe_identifier(self.transport_receipt_id),
                 _is_safe_identifier(self.capture_session_id),
-                self.transport_plane == "webull_mcp_custom_composition",
-                self.tool_name == _EXPECTED_TOOL,
-                self.visible_tool_names == _EXPECTED_VISIBLE_TOOLS,
-                self.canonical_argument_field_names == _EXPECTED_CANONICAL_FIELDS,
-                self.admitted_argument_field_names == _EXPECTED_ADMITTED_ARGUMENT_FIELDS,
+                _is_exact_literal(
+                    self.transport_plane,
+                    "webull_mcp_custom_composition",
+                ),
+                _is_exact_literal(self.tool_name, _EXPECTED_TOOL),
+                _is_exact_string_tuple(
+                    self.visible_tool_names,
+                    _EXPECTED_VISIBLE_TOOLS,
+                ),
+                _is_exact_string_tuple(
+                    self.canonical_argument_field_names,
+                    _EXPECTED_CANONICAL_FIELDS,
+                ),
+                _is_exact_string_tuple(
+                    self.admitted_argument_field_names,
+                    _EXPECTED_ADMITTED_ARGUMENT_FIELDS,
+                ),
                 self.optional_arguments_forwarded is False,
                 type(self.broker_request_budget) is int,
                 self.broker_request_budget == 1,
                 type(self.broker_requests_executed) is int,
                 self.broker_requests_executed == 1,
-                self.lifecycle_status == "CLOSED",
-                self.custody_status == "RAW_DESTROYED",
+                _is_exact_literal(self.lifecycle_status, "CLOSED"),
+                _is_exact_literal(self.custody_status, "RAW_DESTROYED"),
                 self.invocation_completed is True,
-                self.result_container_type == FICTIONAL_RESULT_CONTAINER_TYPE,
-                self.result_payload_class == "formatted_text",
+                _is_exact_literal(
+                    self.result_container_type,
+                    FICTIONAL_RESULT_CONTAINER_TYPE,
+                ),
+                _is_exact_literal(self.result_payload_class, "formatted_text"),
                 self.authentication_error_present is False,
                 self.entitlement_error_present is False,
                 self.protocol_error_present is False,
@@ -282,6 +326,7 @@ class TransportReceipt:
                 self.fixture_admitted is False,
                 self.sdk_called is False,
                 self.execution_authority is False,
+                _is_exact_literal(self.schema_version, TRANSPORT_SCHEMA_VERSION),
             )
         )
 
@@ -342,8 +387,11 @@ class RawWitnessReference:
                 capture_started_at is not None
                 and capture_recorded_at is not None
                 and capture_recorded_at >= capture_started_at,
-                self.source_plane == "webull_mcp_custom_composition",
-                self.tool_name == _EXPECTED_TOOL,
+                _is_exact_literal(
+                    self.source_plane,
+                    "webull_mcp_custom_composition",
+                ),
+                _is_exact_literal(self.tool_name, _EXPECTED_TOOL),
                 self.raw_destroyed is True,
                 self.destruction_verified is True,
                 self.raw_content_retained is False,
@@ -416,21 +464,36 @@ class ScrubbedSnapshotDerivative:
             not _is_safe_identifier(self.revision_of) or self.revision_of in identifiers
         ):
             raise ValueError("revision identity is invalid")
-        if self.source_package != WEBULL_MCP_SOURCE_PACKAGE:
+        if not _is_exact_literal(self.source_package, WEBULL_MCP_SOURCE_PACKAGE):
             raise ValueError("source package is unsupported")
         fictional_contract = (
-            self.source_package_version == FICTIONAL_SOURCE_PACKAGE_VERSION
-            and self.formatter_shape_id == FICTIONAL_FORMATTER_SHAPE_ID
+            _is_exact_literal(
+                self.source_package_version,
+                FICTIONAL_SOURCE_PACKAGE_VERSION,
+            )
+            and _is_exact_literal(
+                self.formatter_shape_id,
+                FICTIONAL_FORMATTER_SHAPE_ID,
+            )
         )
         webull_116_contract = (
-            self.source_package_version == WEBULL_MCP_SOURCE_PACKAGE_VERSION
-            and self.formatter_shape_id == WEBULL_MCP_FORMATTER_SHAPE_ID
+            _is_exact_literal(
+                self.source_package_version,
+                WEBULL_MCP_SOURCE_PACKAGE_VERSION,
+            )
+            and _is_exact_literal(
+                self.formatter_shape_id,
+                WEBULL_MCP_FORMATTER_SHAPE_ID,
+            )
         )
         if not (fictional_contract or webull_116_contract):
             raise ValueError("source formatter contract is unsupported")
-        if not isinstance(self.instrument_symbol, str) or not _SAFE_SYMBOL.fullmatch(
-            self.instrument_symbol
+        if not (
+            _is_exact_literal(self.parser_version, PARSER_VERSION)
+            and _is_exact_literal(self.schema_version, DERIVATIVE_SCHEMA_VERSION)
         ):
+            raise ValueError("parser identity is invalid")
+        if not _is_safe_symbol(self.instrument_symbol):
             raise ValueError("instrument symbol is invalid")
         if not _is_aware_iso8601(self.recorded_at):
             raise ValueError("recorded_at is invalid")
@@ -597,22 +660,35 @@ class AdmissionRefusal:
     execution_authority: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
-        if self.failure_class not in FAILURE_CLASSES:
+        if type(self.failure_class) is not str or self.failure_class not in FAILURE_CLASSES:
             raise ValueError("unsupported admission failure class")
-        if self.source_package not in {WEBULL_MCP_SOURCE_PACKAGE, "UNSUPPORTED"}:
+        if type(self.source_package) is not str or self.source_package not in {
+            WEBULL_MCP_SOURCE_PACKAGE,
+            "UNSUPPORTED",
+        }:
             raise ValueError("unsafe refusal source package")
-        if self.source_package_version not in {
+        if type(self.source_package_version) is not str or self.source_package_version not in {
             FICTIONAL_SOURCE_PACKAGE_VERSION,
             WEBULL_MCP_SOURCE_PACKAGE_VERSION,
             "UNSUPPORTED",
         }:
             raise ValueError("unsafe refusal source package version")
-        if self.formatter_shape_id not in {
+        if type(self.formatter_shape_id) is not str or self.formatter_shape_id not in {
             FICTIONAL_FORMATTER_SHAPE_ID,
             WEBULL_MCP_FORMATTER_SHAPE_ID,
             "UNSUPPORTED",
         }:
             raise ValueError("unsafe refusal formatter shape")
+        if not all(
+            _is_safe_identifier(value)
+            for value in (
+                self.parser_version,
+                self.source_package,
+                self.source_package_version,
+                self.formatter_shape_id,
+            )
+        ):
+            raise ValueError("unsafe refusal contract identity")
         if not _is_safe_identifier(self.raw_reference_id):
             raise ValueError("unsafe refusal raw-reference identity")
         if not _is_safe_identifier(self.transport_receipt_id):
@@ -654,25 +730,31 @@ def _refusal(
     raw_reference_id: str,
     transport_receipt_id: str,
 ) -> AdmissionRefusal:
+    safe_source_package = (
+        source_package
+        if type(source_package) is str
+        and source_package == WEBULL_MCP_SOURCE_PACKAGE
+        else "UNSUPPORTED"
+    )
+    safe_source_package_version = (
+        source_package_version
+        if type(source_package_version) is str
+        and source_package_version
+        in {FICTIONAL_SOURCE_PACKAGE_VERSION, WEBULL_MCP_SOURCE_PACKAGE_VERSION}
+        else "UNSUPPORTED"
+    )
+    safe_formatter_shape_id = (
+        formatter_shape_id
+        if type(formatter_shape_id) is str
+        and formatter_shape_id
+        in {FICTIONAL_FORMATTER_SHAPE_ID, WEBULL_MCP_FORMATTER_SHAPE_ID}
+        else "UNSUPPORTED"
+    )
     return AdmissionRefusal(
         failure_class=failure_class,
-        source_package=(
-            WEBULL_MCP_SOURCE_PACKAGE
-            if source_package == WEBULL_MCP_SOURCE_PACKAGE
-            else "UNSUPPORTED"
-        ),
-        source_package_version=(
-            source_package_version
-            if source_package_version
-            in {FICTIONAL_SOURCE_PACKAGE_VERSION, WEBULL_MCP_SOURCE_PACKAGE_VERSION}
-            else "UNSUPPORTED"
-        ),
-        formatter_shape_id=(
-            formatter_shape_id
-            if formatter_shape_id
-            in {FICTIONAL_FORMATTER_SHAPE_ID, WEBULL_MCP_FORMATTER_SHAPE_ID}
-            else "UNSUPPORTED"
-        ),
+        source_package=safe_source_package,
+        source_package_version=safe_source_package_version,
+        formatter_shape_id=safe_formatter_shape_id,
         raw_reference_id=_safe_identifier(raw_reference_id),
         transport_receipt_id=_safe_identifier(transport_receipt_id),
     )
@@ -767,12 +849,16 @@ def _source_hashes_match(value: Any) -> bool:
         return False
     try:
         supplied = dict(value)
+    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+        raise
     except Exception:
         return False
-    return supplied == dict(WEBULL_MCP_SOURCE_FILE_HASHES) and all(
-        isinstance(key, str) and isinstance(digest, str)
+    if not all(
+        type(key) is str and type(digest) is str
         for key, digest in supplied.items()
-    )
+    ):
+        return False
+    return supplied == dict(WEBULL_MCP_SOURCE_FILE_HASHES)
 
 
 def _admitted_arguments_match(value: Any, *, expected_symbol: str) -> bool:
@@ -780,12 +866,18 @@ def _admitted_arguments_match(value: Any, *, expected_symbol: str) -> bool:
         return False
     try:
         supplied = dict(value)
+    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+        raise
     except Exception:
         return False
+    if len(supplied) != 1:
+        return False
+    key, supplied_symbol = next(iter(supplied.items()))
     return (
-        set(supplied) == {"symbols"}
-        and type(supplied["symbols"]) is str
-        and supplied["symbols"] == expected_symbol
+        type(key) is str
+        and key == "symbols"
+        and type(supplied_symbol) is str
+        and supplied_symbol == expected_symbol
     )
 
 
@@ -987,6 +1079,8 @@ def _extract_original_mcp_result(result_container: Any) -> str:
     if expected_result_type is None:
         try:
             from mcp.types import CallToolResult as expected_result_type
+        except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+            raise
         except Exception as exc:
             raise _ParserRefusal("RESULT_CONTAINER_MISSING") from exc
     if type(result_container) is not expected_result_type:
@@ -1010,6 +1104,13 @@ def _extract_original_mcp_result(result_container: Any) -> str:
             missing,
         )
         model_extra = getattr(result_container, "model_extra", missing)
+        # These protocol fields remain non-authoritative. Accessing them once
+        # inside the guarded envelope boundary prevents hostile descriptors
+        # from escaping while their values remain ignored.
+        getattr(result_container, "content", missing)
+        getattr(result_container, "_meta", missing)
+    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+        raise
     except Exception as exc:
         raise _ParserRefusal("RESULT_CONTAINER_MISSING") from exc
 
@@ -1039,6 +1140,8 @@ def _extract_original_mcp_result(result_container: Any) -> str:
         raise _ParserRefusal("VALUE_TYPE_INVALID")
     try:
         structured_snapshot = dict(structured_content)
+    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+        raise
     except Exception as exc:
         raise _ParserRefusal("VALUE_TYPE_INVALID") from exc
     if "result" not in structured_snapshot:
@@ -1070,8 +1173,8 @@ def admit_formatted_snapshot(
 ) -> AdmissionOutcome:
     """Build a scrubbed candidate or return a value-free categorical refusal."""
 
-    transport_id = getattr(transport_receipt, "transport_receipt_id", "")
-    raw_id = getattr(raw_reference, "raw_reference_id", "")
+    transport_id = "UNAVAILABLE"
+    raw_id = "UNAVAILABLE"
     refusal_args = {
         "source_package": source_package,
         "source_package_version": source_package_version,
@@ -1080,9 +1183,17 @@ def admit_formatted_snapshot(
         "transport_receipt_id": transport_id,
     }
     try:
-        if not isinstance(transport_receipt, TransportReceipt) or not transport_receipt.valid_for_snapshot_admission():
+        if type(transport_receipt) is not TransportReceipt:
             return _refusal("TRANSPORT_RECEIPT_INVALID", **refusal_args)
-        if not isinstance(raw_reference, RawWitnessReference) or not raw_reference.valid_for_snapshot_admission():
+        transport_id = transport_receipt.transport_receipt_id
+        refusal_args["transport_receipt_id"] = transport_id
+        if not transport_receipt.valid_for_snapshot_admission():
+            return _refusal("TRANSPORT_RECEIPT_INVALID", **refusal_args)
+        if type(raw_reference) is not RawWitnessReference:
+            return _refusal("RAW_REFERENCE_INVALID", **refusal_args)
+        raw_id = raw_reference.raw_reference_id
+        refusal_args["raw_reference_id"] = raw_id
+        if not raw_reference.valid_for_snapshot_admission():
             return _refusal("RAW_REFERENCE_INVALID", **refusal_args)
         if transport_receipt.capture_session_id != raw_reference.capture_session_id:
             return _refusal("RAW_REFERENCE_INVALID", **refusal_args)
@@ -1091,24 +1202,36 @@ def admit_formatted_snapshot(
             return _refusal("SECRET_PATTERN_PRESENT", **refusal_args)
         if _IDENTITY_PATTERN.search(structured_content_result):
             return _refusal("IDENTITY_PATTERN_PRESENT", **refusal_args)
-        if source_package != WEBULL_MCP_SOURCE_PACKAGE:
+        if not _is_exact_literal(source_package, WEBULL_MCP_SOURCE_PACKAGE):
             return _refusal("UNSUPPORTED_PACKAGE_VERSION", **refusal_args)
-        if source_package_version not in {
+        if type(source_package_version) is not str or source_package_version not in {
             FICTIONAL_SOURCE_PACKAGE_VERSION,
             WEBULL_MCP_SOURCE_PACKAGE_VERSION,
         }:
             return _refusal("UNSUPPORTED_PACKAGE_VERSION", **refusal_args)
         fictional_contract = (
-            source_package_version == FICTIONAL_SOURCE_PACKAGE_VERSION
-            and formatter_shape_id == FICTIONAL_FORMATTER_SHAPE_ID
+            _is_exact_literal(
+                source_package_version,
+                FICTIONAL_SOURCE_PACKAGE_VERSION,
+            )
+            and _is_exact_literal(
+                formatter_shape_id,
+                FICTIONAL_FORMATTER_SHAPE_ID,
+            )
         )
         webull_116_contract = (
-            source_package_version == WEBULL_MCP_SOURCE_PACKAGE_VERSION
-            and formatter_shape_id == WEBULL_MCP_FORMATTER_SHAPE_ID
+            _is_exact_literal(
+                source_package_version,
+                WEBULL_MCP_SOURCE_PACKAGE_VERSION,
+            )
+            and _is_exact_literal(
+                formatter_shape_id,
+                WEBULL_MCP_FORMATTER_SHAPE_ID,
+            )
         )
         if not (fictional_contract or webull_116_contract):
             return _refusal("UNKNOWN_FORMATTER_SHAPE", **refusal_args)
-        if not isinstance(expected_symbol, str) or not _SAFE_SYMBOL.fullmatch(expected_symbol):
+        if not _is_safe_symbol(expected_symbol):
             return _refusal("SYMBOL_MISMATCH", **refusal_args)
         if webull_116_contract:
             if not _source_hashes_match(source_file_hashes):
@@ -1171,6 +1294,8 @@ def admit_formatted_snapshot(
             ),
             _construction_seal=_DERIVATIVE_CONSTRUCTION_SEAL,
         )
+    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+        raise
     except _ParserRefusal as exc:
         return _refusal(exc.failure_class, **refusal_args)
     except Exception:
@@ -1184,21 +1309,29 @@ def register_human_approved_derivative(
 ) -> AdmissionOutcome:
     """Register SHA-256 only after an explicit human-review authorization."""
 
-    if (
-        not isinstance(derivative, ScrubbedSnapshotDerivative)
-        or human_review_authorized is not True
-        or derivative.human_review_status != "PENDING"
-        or derivative.sha256_registration is not None
-    ):
+    if type(derivative) is not ScrubbedSnapshotDerivative:
         return _refusal(
             "HUMAN_REVIEW_REQUIRED",
-            source_package=getattr(derivative, "source_package", ""),
-            source_package_version=getattr(derivative, "source_package_version", ""),
-            formatter_shape_id=getattr(derivative, "formatter_shape_id", ""),
-            raw_reference_id=getattr(derivative, "raw_reference_id", ""),
-            transport_receipt_id=getattr(derivative, "transport_receipt_id", ""),
+            source_package="",
+            source_package_version="",
+            formatter_shape_id="",
+            raw_reference_id="",
+            transport_receipt_id="",
         )
     try:
+        if (
+            human_review_authorized is not True
+            or derivative.human_review_status != "PENDING"
+            or derivative.sha256_registration is not None
+        ):
+            return _refusal(
+                "HUMAN_REVIEW_REQUIRED",
+                source_package=derivative.source_package,
+                source_package_version=derivative.source_package_version,
+                formatter_shape_id=derivative.formatter_shape_id,
+                raw_reference_id=derivative.raw_reference_id,
+                transport_receipt_id=derivative.transport_receipt_id,
+            )
         approved_payload = derivative.to_dict(include_hash=False)
         approved_payload["human_review_status"] = "APPROVED"
         digest = _canonical_sha256(approved_payload)
@@ -1208,6 +1341,8 @@ def register_human_approved_derivative(
             sha256_registration=digest,
             _construction_seal=_DERIVATIVE_CONSTRUCTION_SEAL,
         )
+    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+        raise
     except Exception:
         return _refusal(
             "PARSER_INTERNAL_ERROR",

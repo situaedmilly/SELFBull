@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import os
 import sys
@@ -26,6 +26,22 @@ class FakeTool:
     name: str
 
 
+class FakeLowLevelServer:
+    def __init__(self) -> None:
+        self.run_calls = 0
+        self.initialization_option_calls = 0
+
+    async def run(self, *_args, **_kwargs):
+        self.run_calls += 1
+
+    def create_initialization_options(self):
+        self.initialization_option_calls += 1
+        return {"capability": "fictional"}
+
+    async def call_tool(self, *_args, **_kwargs):
+        raise AssertionError("raw low-level invocation must not be exposed")
+
+
 class FakeServer:
     def __init__(self, tool_names: list[str]):
         self.tool_names = list(tool_names)
@@ -35,6 +51,11 @@ class FakeServer:
         self.network_called = False
         self.credentials_read = False
         self.server_started = False
+        self._mcp_server = FakeLowLevelServer()
+
+    @asynccontextmanager
+    async def _lifespan_manager(self):
+        yield
 
     async def list_tools(self):
         return [FakeTool(name) for name in self.tool_names]
@@ -78,7 +99,6 @@ class TestCompositionContract(unittest.TestCase):
         )
 
         self.assertIsInstance(composed, SnapshotOnlyServer)
-        self.assertEqual(asyncio.run(composed.list_tools()), ("get_stock_snapshot",))
         self.assertEqual(composed.receipt.visible_tool_names, ("get_stock_snapshot",))
         self.assertTrue(composed.receipt.exact_surface_match)
         self.assertEqual(server.tool_names, ["get_stock_snapshot"])
@@ -100,23 +120,34 @@ class TestCompositionContract(unittest.TestCase):
         self.assertEqual(composed.receipt.broker_request_count, 0)
         self.assertFalse(composed.receipt.sdk_called)
         self.assertFalse(composed.receipt.execution_authority)
+        self.assertIsNot(composed._server, server)
+        self.assertIsNot(composed._server._mcp_server, server._mcp_server)
+        self.assertFalse(hasattr(composed, "call_tool"))
+        self.assertFalse(hasattr(composed, "list_tools"))
+        self.assertFalse(hasattr(composed._server, "call_tool"))
+        self.assertFalse(hasattr(composed._server, "list_tools"))
+        self.assertFalse(hasattr(composed._server, "remove_tool"))
+        self.assertFalse(hasattr(composed._server, "add_tool"))
+        self.assertFalse(hasattr(composed._server._mcp_server, "call_tool"))
+        self.assertFalse(hasattr(composed._server._mcp_server, "_run"))
+        self.assertFalse(hasattr(composed._server._mcp_server, "__dict__"))
+        self.assertIs(composed._server._lifespan_manager.__self__, composed._server)
+        self.assertIs(composed._server._mcp_server.run.__self__, composed._server._mcp_server)
+        with self.assertRaises(AttributeError):
+            composed._server._mcp_server = server._mcp_server  # type: ignore[misc]
+        self.assertEqual(
+            composed._server._mcp_server.create_initialization_options(),
+            {"capability": "fictional"},
+        )
 
-    def test_snapshot_invocation_is_permitted_and_other_tools_refuse(self):
+    def test_generic_facade_invocation_and_raw_server_escape_are_absent(self):
         server = FakeServer(["get_stock_snapshot", "create_watchlist"])
         composed = build_snapshot_only_server(config=object(), build_server_fn=lambda _config: server)
 
-        result = asyncio.run(composed.call_tool("get_stock_snapshot", {"symbol": "SPY"}))
-        self.assertEqual(result["name"], "get_stock_snapshot")
-        self.assertEqual(server.calls, [("get_stock_snapshot", {"symbol": "SPY"})])
-
-        with self.assertRaises(CompositionError):
-            asyncio.run(composed.call_tool("create_watchlist", {"name": "Tech Stocks"}))
-
-        with self.assertRaises(CompositionError):
-            asyncio.run(composed.call_tool("get_account_balance", {}))
-
-        with self.assertRaises(CompositionError):
-            asyncio.run(composed.call_tool("place_stock_order", {}))
+        self.assertFalse(hasattr(composed, "call_tool"))
+        self.assertFalse(hasattr(composed._server, "call_tool"))
+        self.assertFalse(hasattr(composed._server._mcp_server, "call_tool"))
+        self.assertEqual(server.calls, [])
 
     def test_unknown_and_malformed_names_fail_closed(self):
         receipt = validate_snapshot_only_surface(FakeServer(["get_stock_snapshot", "get_watchlists"]))
@@ -129,11 +160,22 @@ class TestCompositionContract(unittest.TestCase):
         with self.assertRaises(CompositionError):
             validate_snapshot_only_surface(FakeServer(["get_stock_snapshot", "get_stock_snapshot"]))
 
+        for malformed in (
+            " get_stock_snapshot",
+            "get_stock_snapshot ",
+            "\tget_stock_snapshot",
+            "get_stock_snapshot\n",
+            "get_stock_snapshot\u00a0",
+        ):
+            with self.subTest(malformed=repr(malformed)):
+                with self.assertRaises(CompositionError):
+                    validate_snapshot_only_surface(FakeServer([malformed]))
+
     def test_future_upstream_tools_remain_disabled_after_composition(self):
         server = FakeServer(["get_stock_snapshot", "get_stock_latest_news", "get_watchlists"])
         composed = build_snapshot_only_server(config=object(), build_server_fn=lambda _config: server)
 
-        self.assertEqual(asyncio.run(composed.list_tools()), ("get_stock_snapshot",))
+        self.assertEqual(composed.receipt.visible_tool_names, ("get_stock_snapshot",))
         self.assertEqual(server.tool_names, ["get_stock_snapshot"])
         self.assertEqual(server.removed, ["get_stock_latest_news", "get_watchlists"])
 
@@ -143,15 +185,21 @@ class TestCompositionContract(unittest.TestCase):
 
         server.add_tool("create_watchlist")
 
-        with self.assertRaises(CompositionError):
-            asyncio.run(composed.list_tools())
-
-        with self.assertRaises(CompositionError):
-            asyncio.run(composed.call_tool("get_stock_snapshot", {"symbol": "SPY"}))
+        drift_receipt = validate_snapshot_only_surface(server)
+        self.assertFalse(drift_receipt.exact_surface_match)
+        self.assertEqual(drift_receipt.forbidden_visible_tool_names, ("create_watchlist",))
+        self.assertFalse(hasattr(composed, "call_tool"))
 
     def test_refuses_when_surface_cannot_be_pruned_to_one_tool(self):
         server = FakeServer(["get_stock_snapshot", "create_watchlist"])
         server.remove_tool = None  # type: ignore[assignment]
+
+        with self.assertRaises(CompositionError):
+            build_snapshot_only_server(config=object(), build_server_fn=lambda _config: server)
+
+    def test_refuses_server_without_bounded_lifecycle_capability(self):
+        server = FakeServer(["get_stock_snapshot"])
+        server._mcp_server = None
 
         with self.assertRaises(CompositionError):
             build_snapshot_only_server(config=object(), build_server_fn=lambda _config: server)

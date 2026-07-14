@@ -14,6 +14,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Sequence, Tuple
@@ -111,6 +112,10 @@ class _ReceiptVerifyError(InventoryError):
     pass
 
 
+class _ProcessGroupTerminationError(InventoryError):
+    """Raised when a timed-out subprocess group cannot be proven absent."""
+
+
 @dataclass(frozen=True)
 class ProcessOutcome:
     returncode: int
@@ -131,26 +136,86 @@ def _process_exists(pid: int) -> bool:
     return True
 
 
+def _process_group_exists(
+    process_group_id: int,
+    *,
+    killpg: Callable[[int, int], None] = os.killpg,
+) -> bool:
+    try:
+        killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_process_group_exit(
+    process_group_id: int,
+    *,
+    timeout: float,
+    group_exists: Callable[[int], bool],
+) -> bool:
+    deadline = time.monotonic() + max(timeout, 0)
+    while group_exists(process_group_id):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.01, remaining))
+    return True
+
+
 def _terminate_process_group(
     process: subprocess.Popen,
     *,
     grace_period: float,
     killpg: Callable[[int, int], None] = os.killpg,
+    group_exists: Optional[Callable[[int], bool]] = None,
 ) -> int:
-    """Terminate and reap the whole process group without using a shell."""
-    try:
-        killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return process.wait(timeout=grace_period)
+    """Terminate, prove absent, and reap the whole process group."""
+    process_group_id = process.pid
+    if group_exists is None:
+        group_exists = lambda pid: _process_group_exists(pid, killpg=killpg)
 
     try:
-        return process.wait(timeout=grace_period)
+        killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+    parent_returncode: Optional[int] = None
+    try:
+        parent_returncode = process.wait(timeout=grace_period)
     except subprocess.TimeoutExpired:
+        pass
+
+    group_gone = _wait_for_process_group_exit(
+        process_group_id,
+        timeout=grace_period,
+        group_exists=group_exists,
+    )
+    if not group_gone:
         try:
-            killpg(process.pid, signal.SIGKILL)
+            killpg(process_group_id, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        return process.wait(timeout=grace_period)
+
+    if parent_returncode is None:
+        try:
+            parent_returncode = process.wait(timeout=grace_period)
+        except subprocess.TimeoutExpired as exc:
+            raise _ProcessGroupTerminationError(
+                "timed-out process parent could not be reaped"
+            ) from exc
+
+    if not _wait_for_process_group_exit(
+        process_group_id,
+        timeout=grace_period,
+        group_exists=group_exists,
+    ):
+        raise _ProcessGroupTerminationError(
+            "timed-out process group could not be proven absent"
+        )
+    return parent_returncode
 
 
 def _run_process(
@@ -163,6 +228,7 @@ def _run_process(
     grace_period: float = 1,
     popen_factory: Callable[..., subprocess.Popen] = subprocess.Popen,
     killpg: Callable[[int, int], None] = os.killpg,
+    group_exists: Optional[Callable[[int], bool]] = None,
 ) -> ProcessOutcome:
     """Run one command in a new session and kill all descendants on timeout."""
     process = popen_factory(
@@ -180,6 +246,7 @@ def _run_process(
             process,
             grace_period=grace_period,
             killpg=killpg,
+            group_exists=group_exists,
         )
         return ProcessOutcome(returncode=returncode, timed_out=True)
 
@@ -384,6 +451,10 @@ def inspect_inventory(
                         grace_period=grace_period,
                     )
                 except subprocess.TimeoutExpired:
+                    primary_failure = FAILURE_PROCESS_TIMEOUT
+                    result["status"] = STATUS_TIMEOUT
+                    outcome = None
+                except _ProcessGroupTerminationError:
                     primary_failure = FAILURE_PROCESS_TIMEOUT
                     result["status"] = STATUS_TIMEOUT
                     outcome = None

@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from types import MappingProxyType
-from typing import Any, Callable, Mapping, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 SCHEMA_VERSION = "004B.mcp-session-harness.v2"
 
@@ -43,6 +44,8 @@ class MCPInvocation:
     arguments: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.arguments, Mapping):
+            raise TypeError("arguments must be a mapping")
         object.__setattr__(self, "arguments", MappingProxyType(dict(self.arguments)))
 
 
@@ -90,21 +93,16 @@ def _blank_receipt() -> MCPSessionReceipt:
     )
 
 
-def _seal_receipt(receipt: MCPSessionReceipt) -> MCPSessionReceipt:
-    return MCPSessionReceipt(
-        schema_version=receipt.schema_version,
-        initialized=receipt.initialized,
-        visible_tool_names=receipt.visible_tool_names,
-        exact_surface_match=receipt.exact_surface_match,
-        invocation_requested=receipt.invocation_requested,
-        invoked_tool_name=receipt.invoked_tool_name,
-        invocation_completed=receipt.invocation_completed,
-        invocation_result_type=receipt.invocation_result_type,
-        timeout=receipt.timeout,
-        failure_class=receipt.failure_class,
-        client_closed=True,
-        server_closed=True,
-        broker_request_count=receipt.broker_request_count,
+def _finalize_receipt(
+    receipt: MCPSessionReceipt,
+    *,
+    client_closed: bool,
+    server_closed: bool,
+) -> MCPSessionReceipt:
+    return replace(
+        receipt,
+        client_closed=client_closed,
+        server_closed=server_closed,
         execution_authority=False,
     )
 
@@ -156,6 +154,13 @@ def _default_lifecycle_adapter() -> MCPLifecycleAdapter:
     )
 
 
+def _validated_tool_name(tool: Any) -> str:
+    name = getattr(tool, "name", None)
+    if not isinstance(name, str) or not name or name != name.strip():
+        raise ValueError("Malformed tool inventory")
+    return name
+
+
 def _extract_tool_names(list_tools_result: Any) -> Tuple[str, ...]:
     tools = getattr(list_tools_result, "tools", list_tools_result)
     if tools is None:
@@ -163,13 +168,10 @@ def _extract_tool_names(list_tools_result: Any) -> Tuple[str, ...]:
 
     names: list[str] = []
     for tool in tools:
-        name = getattr(tool, "name", None)
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("Malformed tool inventory")
-        normalized = name.strip()
-        if normalized in names:
+        name = _validated_tool_name(tool)
+        if name in names:
             raise ValueError("Duplicate tool names detected")
-        names.append(normalized)
+        names.append(name)
     return tuple(sorted(names))
 
 
@@ -182,13 +184,10 @@ def _extract_tool_descriptors(list_tools_result: Any) -> dict[str, Any]:
 
     descriptors: dict[str, Any] = {}
     for tool in tools:
-        name = getattr(tool, "name", None)
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("Malformed tool inventory")
-        normalized = name.strip()
-        if normalized in descriptors:
+        name = _validated_tool_name(tool)
+        if name in descriptors:
             raise ValueError("Duplicate tool names detected")
-        descriptors[normalized] = tool
+        descriptors[name] = tool
     return descriptors
 
 
@@ -293,23 +292,154 @@ def _failure_receipt(
     timeout: bool = False,
     broker_request_count: int = 0,
 ) -> MCPSessionReceipt:
-    return _seal_receipt(
-        MCPSessionReceipt(
-            schema_version=SCHEMA_VERSION,
-            initialized=initialized,
-            visible_tool_names=visible_tool_names,
-            exact_surface_match=exact_surface_match,
+    return MCPSessionReceipt(
+        schema_version=SCHEMA_VERSION,
+        initialized=initialized,
+        visible_tool_names=visible_tool_names,
+        exact_surface_match=exact_surface_match,
+        invocation_requested=invocation_requested,
+        invoked_tool_name=invoked_tool_name,
+        invocation_completed=invocation_completed,
+        invocation_result_type=invocation_result_type,
+        timeout=timeout,
+        failure_class=failure_class,
+        client_closed=False,
+        server_closed=False,
+        broker_request_count=broker_request_count,
+        execution_authority=False,
+    )
+
+
+async def _run_session_protocol(
+    session: Any,
+    *,
+    expected_tool_names: frozenset[str],
+    invocation: Optional[MCPInvocation],
+    timeout_seconds: float,
+) -> MCPSessionReceipt:
+    invocation_requested = invocation is not None
+    invoked_tool_name = invocation.tool_name if invocation is not None else None
+
+    try:
+        await session.initialize()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return _failure_receipt(
+            failure_class=_classify_stage_failure("CLIENT_INITIALIZATION_FAILED", exc),
             invocation_requested=invocation_requested,
             invoked_tool_name=invoked_tool_name,
-            invocation_completed=invocation_completed,
-            invocation_result_type=invocation_result_type,
-            timeout=timeout,
-            failure_class=failure_class,
-            client_closed=False,
-            server_closed=False,
-            broker_request_count=broker_request_count,
-            execution_authority=False,
         )
+
+    try:
+        tools_result = await session.list_tools()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return _failure_receipt(
+            failure_class=_classify_stage_failure("DISCOVERY_FAILED", exc),
+            invocation_requested=invocation_requested,
+            invoked_tool_name=invoked_tool_name,
+            initialized=True,
+        )
+
+    try:
+        tool_descriptors = _extract_tool_descriptors(tools_result)
+        visible_tool_names = tuple(sorted(tool_descriptors))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return _failure_receipt(
+            failure_class=_classify_stage_failure("DISCOVERY_FAILED", exc),
+            invocation_requested=invocation_requested,
+            invoked_tool_name=invoked_tool_name,
+            initialized=True,
+        )
+
+    exact_surface_match = _surface_matches(visible_tool_names, expected_tool_names)
+    if not exact_surface_match:
+        return _failure_receipt(
+            failure_class="SURFACE_MISMATCH",
+            invocation_requested=invocation_requested,
+            invoked_tool_name=invoked_tool_name,
+            initialized=True,
+            visible_tool_names=visible_tool_names,
+            exact_surface_match=False,
+        )
+
+    if invocation is not None and invocation.tool_name not in expected_tool_names:
+        return _failure_receipt(
+            failure_class="TOOL_NOT_ALLOWED",
+            invocation_requested=True,
+            invoked_tool_name=invocation.tool_name,
+            initialized=True,
+            visible_tool_names=visible_tool_names,
+            exact_surface_match=True,
+        )
+
+    if invocation is None:
+        return _failure_receipt(
+            failure_class="NONE",
+            invocation_requested=False,
+            invoked_tool_name=None,
+            initialized=True,
+            visible_tool_names=visible_tool_names,
+            exact_surface_match=True,
+        )
+
+    try:
+        admitted_arguments = _admit_invocation_arguments(
+            tool_descriptors[invocation.tool_name], invocation.arguments
+        )
+    except _SchemaAdmissionError:
+        return _failure_receipt(
+            failure_class="SCHEMA_ADMISSION_FAILED",
+            invocation_requested=True,
+            invoked_tool_name=invocation.tool_name,
+            initialized=True,
+            visible_tool_names=visible_tool_names,
+            exact_surface_match=True,
+        )
+
+    try:
+        result = await asyncio.wait_for(
+            session.call_tool(invocation.tool_name, admitted_arguments),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError as exc:
+        return _failure_receipt(
+            failure_class=_classify_stage_failure("TIMEOUT", exc),
+            invocation_requested=True,
+            invoked_tool_name=invocation.tool_name,
+            initialized=True,
+            visible_tool_names=visible_tool_names,
+            exact_surface_match=True,
+            timeout=True,
+            broker_request_count=1,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return _failure_receipt(
+            failure_class=_classify_stage_failure("INVOCATION_FAILED", exc),
+            invocation_requested=True,
+            invoked_tool_name=invocation.tool_name,
+            initialized=True,
+            visible_tool_names=visible_tool_names,
+            exact_surface_match=True,
+            broker_request_count=1,
+        )
+
+    return _failure_receipt(
+        failure_class="NONE",
+        invocation_requested=True,
+        invoked_tool_name=invocation.tool_name,
+        initialized=True,
+        visible_tool_names=visible_tool_names,
+        exact_surface_match=True,
+        invocation_completed=True,
+        invocation_result_type=type(result).__name__,
+        broker_request_count=1,
     )
 
 
@@ -327,14 +457,25 @@ async def run_in_memory_mcp_session(
     expected_tool_names = frozenset(expected_tool_names)
     invocation_requested = invocation is not None
     invoked_tool_name = invocation.tool_name if invocation is not None else None
+    receipt: Optional[MCPSessionReceipt] = None
+    session_exit_completed = False
+    lifespan_exit_completed = False
+    cancellation_pending = False
 
     try:
         lifespan_context = adapter.lifespan_context_factory(server)
-    except BaseException as exc:
-        return _failure_receipt(
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        receipt = _failure_receipt(
             failure_class=_classify_stage_failure("LIFESPAN_START_FAILED", exc),
             invocation_requested=invocation_requested,
             invoked_tool_name=invoked_tool_name,
+        )
+        return _finalize_receipt(
+            receipt,
+            client_closed=session_exit_completed,
+            server_closed=(session_exit_completed and lifespan_exit_completed),
         )
 
     lifespan_entered = False
@@ -344,157 +485,96 @@ async def run_in_memory_mcp_session(
 
             try:
                 low_level_server = adapter.low_level_server_resolver(server)
-            except BaseException as exc:
-                return _failure_receipt(
+            except asyncio.CancelledError:
+                cancellation_pending = True
+            except Exception as exc:
+                receipt = _failure_receipt(
                     failure_class=_classify_stage_failure("SERVER_RESOLUTION_FAILED", exc),
                     invocation_requested=invocation_requested,
                     invoked_tool_name=invoked_tool_name,
                 )
-
-            try:
-                session_context = adapter.connected_session_factory(low_level_server, timeout_seconds)
-            except BaseException as exc:
-                return _failure_receipt(
-                    failure_class=_classify_stage_failure("CLIENT_SESSION_START_FAILED", exc),
-                    invocation_requested=invocation_requested,
-                    invoked_tool_name=invoked_tool_name,
-                )
-
-            session_entered = False
-            try:
-                async with session_context as session:
-                    session_entered = True
-
-                    try:
-                        await session.initialize()
-                    except BaseException as exc:
-                        return _failure_receipt(
-                            failure_class=_classify_stage_failure("CLIENT_INITIALIZATION_FAILED", exc),
-                            invocation_requested=invocation_requested,
-                            invoked_tool_name=invoked_tool_name,
-                        )
-
-                    try:
-                        tools_result = await session.list_tools()
-                    except BaseException as exc:
-                        return _failure_receipt(
-                            failure_class=_classify_stage_failure("DISCOVERY_FAILED", exc),
-                            invocation_requested=invocation_requested,
-                            invoked_tool_name=invoked_tool_name,
-                            initialized=True,
-                        )
-
-                    try:
-                        tool_descriptors = _extract_tool_descriptors(tools_result)
-                        visible_tool_names = tuple(sorted(tool_descriptors))
-                    except BaseException as exc:
-                        return _failure_receipt(
-                            failure_class=_classify_stage_failure("DISCOVERY_FAILED", exc),
-                            invocation_requested=invocation_requested,
-                            invoked_tool_name=invoked_tool_name,
-                            initialized=True,
-                        )
-
-                    exact_surface_match = _surface_matches(visible_tool_names, expected_tool_names)
-                    if not exact_surface_match:
-                        return _failure_receipt(
-                            failure_class="SURFACE_MISMATCH",
-                            invocation_requested=invocation_requested,
-                            invoked_tool_name=invoked_tool_name,
-                            initialized=True,
-                            visible_tool_names=visible_tool_names,
-                            exact_surface_match=False,
-                        )
-
-                    if invocation is not None and invocation.tool_name not in expected_tool_names:
-                        return _failure_receipt(
-                            failure_class="TOOL_NOT_ALLOWED",
-                            invocation_requested=True,
-                            invoked_tool_name=invocation.tool_name,
-                            initialized=True,
-                            visible_tool_names=visible_tool_names,
-                            exact_surface_match=True,
-                        )
-
-                    if invocation is None:
-                        return _failure_receipt(
-                            failure_class="NONE",
-                            invocation_requested=False,
-                            invoked_tool_name=None,
-                            initialized=True,
-                            visible_tool_names=visible_tool_names,
-                            exact_surface_match=True,
-                        )
-
-                    try:
-                        admitted_arguments = _admit_invocation_arguments(
-                            tool_descriptors[invocation.tool_name], invocation.arguments
-                        )
-                    except _SchemaAdmissionError:
-                        return _failure_receipt(
-                            failure_class="SCHEMA_ADMISSION_FAILED",
-                            invocation_requested=True,
-                            invoked_tool_name=invocation.tool_name,
-                            initialized=True,
-                            visible_tool_names=visible_tool_names,
-                            exact_surface_match=True,
-                        )
-
-                    try:
-                        result = await asyncio.wait_for(
-                            session.call_tool(invocation.tool_name, admitted_arguments),
-                            timeout=timeout_seconds,
-                        )
-                    except asyncio.TimeoutError as exc:
-                        return _failure_receipt(
-                            failure_class=_classify_stage_failure("TIMEOUT", exc),
-                            invocation_requested=True,
-                            invoked_tool_name=invocation.tool_name,
-                            initialized=True,
-                            visible_tool_names=visible_tool_names,
-                            exact_surface_match=True,
-                            timeout=True,
-                            broker_request_count=1,
-                        )
-                    except BaseException as exc:
-                        return _failure_receipt(
-                            failure_class=_classify_stage_failure("INVOCATION_FAILED", exc),
-                            invocation_requested=True,
-                            invoked_tool_name=invocation.tool_name,
-                            initialized=True,
-                            visible_tool_names=visible_tool_names,
-                            exact_surface_match=True,
-                            broker_request_count=1,
-                        )
-
-                    return _failure_receipt(
-                        failure_class="NONE",
-                        invocation_requested=True,
-                        invoked_tool_name=invocation.tool_name,
-                        initialized=True,
-                        visible_tool_names=visible_tool_names,
-                        exact_surface_match=True,
-                        invocation_completed=True,
-                        invocation_result_type=type(result).__name__,
-                        broker_request_count=1,
+            else:
+                try:
+                    session_context = adapter.connected_session_factory(
+                        low_level_server, timeout_seconds
                     )
-            except BaseException as exc:
-                failure_class = "SHUTDOWN_FAILED" if session_entered else "CLIENT_SESSION_START_FAILED"
-                return _failure_receipt(
+                except asyncio.CancelledError:
+                    cancellation_pending = True
+                except Exception as exc:
+                    receipt = _failure_receipt(
+                        failure_class=_classify_stage_failure(
+                            "CLIENT_SESSION_START_FAILED", exc
+                        ),
+                        invocation_requested=invocation_requested,
+                        invoked_tool_name=invoked_tool_name,
+                    )
+                else:
+                    session_entered = False
+                    try:
+                        async with session_context as session:
+                            session_entered = True
+                            try:
+                                receipt = await _run_session_protocol(
+                                    session,
+                                    expected_tool_names=expected_tool_names,
+                                    invocation=invocation,
+                                    timeout_seconds=timeout_seconds,
+                                )
+                            except asyncio.CancelledError:
+                                cancellation_pending = True
+                                raise
+                        session_exit_completed = True
+                    except asyncio.CancelledError:
+                        cancellation_pending = True
+                    except Exception as exc:
+                        if not cancellation_pending:
+                            failure_class = (
+                                "SHUTDOWN_FAILED"
+                                if session_entered
+                                else "CLIENT_SESSION_START_FAILED"
+                            )
+                            if receipt is None:
+                                receipt = _failure_receipt(
+                                    failure_class=_classify_stage_failure(failure_class, exc),
+                                    invocation_requested=invocation_requested,
+                                    invoked_tool_name=invoked_tool_name,
+                                )
+                            else:
+                                receipt = replace(
+                                    receipt,
+                                    failure_class=_classify_stage_failure(failure_class, exc),
+                                )
+            if cancellation_pending:
+                raise asyncio.CancelledError()
+        lifespan_exit_completed = True
+    except asyncio.CancelledError:
+        cancellation_pending = True
+    except Exception as exc:
+        if not cancellation_pending:
+            failure_class = "SHUTDOWN_FAILED" if lifespan_entered else "LIFESPAN_START_FAILED"
+            if receipt is None:
+                receipt = _failure_receipt(
                     failure_class=_classify_stage_failure(failure_class, exc),
                     invocation_requested=invocation_requested,
                     invoked_tool_name=invoked_tool_name,
                 )
-    except BaseException as exc:
-        failure_class = "SHUTDOWN_FAILED" if lifespan_entered else "LIFESPAN_START_FAILED"
-        return _failure_receipt(
-            failure_class=_classify_stage_failure(failure_class, exc),
+            else:
+                receipt = replace(
+                    receipt,
+                    failure_class=_classify_stage_failure(failure_class, exc),
+                )
+
+    if cancellation_pending:
+        raise asyncio.CancelledError()
+
+    if receipt is None:
+        receipt = _failure_receipt(
+            failure_class="UNEXPECTED_ERROR",
             invocation_requested=invocation_requested,
             invoked_tool_name=invoked_tool_name,
         )
-
-    return _failure_receipt(
-        failure_class="UNEXPECTED_ERROR",
-        invocation_requested=invocation_requested,
-        invoked_tool_name=invoked_tool_name,
+    return _finalize_receipt(
+        receipt,
+        client_closed=session_exit_completed,
+        server_closed=(session_exit_completed and lifespan_exit_completed),
     )

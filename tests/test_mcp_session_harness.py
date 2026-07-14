@@ -6,7 +6,7 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Optional
 from unittest import IsolatedAsyncioTestCase
 
@@ -435,6 +435,34 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         self.assertTrue(receipt.server_closed)
         self.assertNotIn("call_tool", scenario.events)
 
+    async def test_discovery_rejects_edge_whitespace_without_normalizing_names(self):
+        malformed_names = (
+            " fictional_snapshot",
+            "fictional_snapshot ",
+            "\u00a0fictional_snapshot",
+            "fictional_snapshot\u00a0",
+        )
+        for tool_name in malformed_names:
+            with self.subTest(tool_name=repr(tool_name)):
+                scenario = SessionScenario(
+                    visible_tool_names=[tool_name],
+                    tool_schemas={tool_name: _stock_snapshot_schema()},
+                )
+                server = FakeHighLevelServer(scenario)
+
+                receipt = await run_in_memory_mcp_session(
+                    server,
+                    expected_tool_names=frozenset({"fictional_snapshot"}),
+                    timeout_seconds=1.0,
+                    lifecycle_adapter=_make_adapter(scenario, server),
+                )
+
+                self.assertEqual(receipt.failure_class, "DISCOVERY_FAILED")
+                self.assertEqual(receipt.visible_tool_names, ())
+                self.assertEqual(scenario.call_tool_calls, 0)
+                self.assertTrue(receipt.client_closed)
+                self.assertTrue(receipt.server_closed)
+
     async def test_timeout_becomes_controlled(self):
         scenario = SessionScenario(call_delay=0.1)
         server = FakeHighLevelServer(scenario)
@@ -525,8 +553,8 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
 
         self.assertEqual(receipt.failure_class, "LIFESPAN_START_FAILED")
         self.assertFalse(receipt.initialized)
-        self.assertTrue(receipt.client_closed)
-        self.assertTrue(receipt.server_closed)
+        self.assertFalse(receipt.client_closed)
+        self.assertFalse(receipt.server_closed)
         self.assertEqual(server._lifespan.entered, 1)
         self.assertEqual(server._lifespan.exited, 0)
         self.assertEqual(scenario.events, ["lifespan_enter"])
@@ -546,7 +574,7 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
 
         self.assertEqual(receipt.failure_class, "SHUTDOWN_FAILED")
         self.assertTrue(receipt.client_closed)
-        self.assertTrue(receipt.server_closed)
+        self.assertFalse(receipt.server_closed)
         self.assertEqual(server._lifespan.entered, 1)
         self.assertEqual(server._lifespan.exited, 1)
         self.assertEqual(scenario.events[-2:], ["session_exit", "lifespan_exit"])
@@ -581,8 +609,9 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(receipt.failure_class, "SERVER_RESOLUTION_FAILED")
-        self.assertTrue(receipt.client_closed)
-        self.assertTrue(receipt.server_closed)
+        self.assertFalse(receipt.client_closed)
+        self.assertFalse(receipt.server_closed)
+        self.assertFalse(receipt.execution_authority)
 
     async def test_shutdown_failure_is_controlled(self):
         scenario = SessionScenario(session_exit_error=RuntimeError("shutdown failed"))
@@ -598,8 +627,202 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(receipt.failure_class, "SHUTDOWN_FAILED")
-        self.assertTrue(receipt.client_closed)
-        self.assertTrue(receipt.server_closed)
+        self.assertFalse(receipt.client_closed)
+        self.assertFalse(receipt.server_closed)
+        self.assertFalse(receipt.execution_authority)
+        pending = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task() and not task.done()
+        ]
+        self.assertEqual(pending, [])
+
+    async def test_dual_shutdown_failure_reports_neither_layer_closed(self):
+        scenario = SessionScenario(
+            session_exit_error=RuntimeError("session shutdown failed"),
+            lifespan_exit_error=RuntimeError("lifespan shutdown failed"),
+        )
+        server = FakeHighLevelServer(scenario)
+
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"fictional_snapshot"}),
+            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            timeout_seconds=1.0,
+            lifecycle_adapter=_make_adapter(scenario, server),
+        )
+
+        self.assertEqual(receipt.failure_class, "SHUTDOWN_FAILED")
+        self.assertFalse(receipt.client_closed)
+        self.assertFalse(receipt.server_closed)
+        self.assertFalse(receipt.execution_authority)
+        self.assertEqual(scenario.events[-2:], ["session_exit", "lifespan_exit"])
+        pending = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task() and not task.done()
+        ]
+        self.assertEqual(pending, [])
+
+    async def test_session_entry_failure_reports_only_confirmed_server_closure(self):
+        scenario = SessionScenario(session_enter_error=RuntimeError("session start failed"))
+        server = FakeHighLevelServer(scenario)
+
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"fictional_snapshot"}),
+            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            timeout_seconds=1.0,
+            lifecycle_adapter=_make_adapter(scenario, server),
+        )
+
+        self.assertEqual(receipt.failure_class, "CLIENT_SESSION_START_FAILED")
+        self.assertFalse(receipt.client_closed)
+        self.assertFalse(receipt.server_closed)
+        self.assertFalse(receipt.execution_authority)
+        self.assertEqual(scenario.events[-1], "lifespan_exit")
+
+    async def test_cancelled_error_propagates_from_every_async_boundary(self):
+        scenarios = (
+            SessionScenario(lifespan_error=asyncio.CancelledError()),
+            SessionScenario(session_enter_error=asyncio.CancelledError()),
+            SessionScenario(initialize_error=asyncio.CancelledError()),
+            SessionScenario(discovery_error=asyncio.CancelledError()),
+            SessionScenario(invocation_error=asyncio.CancelledError()),
+            SessionScenario(session_exit_error=asyncio.CancelledError()),
+            SessionScenario(lifespan_exit_error=asyncio.CancelledError()),
+        )
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                server = FakeHighLevelServer(scenario)
+                with self.assertRaises(asyncio.CancelledError):
+                    await run_in_memory_mcp_session(
+                        server,
+                        expected_tool_names=frozenset({"fictional_snapshot"}),
+                        invocation=MCPInvocation(
+                            "fictional_snapshot", {"symbol": "SPY"}
+                        ),
+                        timeout_seconds=1.0,
+                        lifecycle_adapter=_make_adapter(scenario, server),
+                    )
+
+                pending = [
+                    task
+                    for task in asyncio.all_tasks()
+                    if task is not asyncio.current_task() and not task.done()
+                ]
+                self.assertEqual(pending, [])
+
+    async def test_cancellation_survives_session_cleanup_failure(self):
+        scenario = SessionScenario(
+            invocation_error=asyncio.CancelledError(),
+            session_exit_error=RuntimeError("session cleanup failed"),
+        )
+        server = FakeHighLevelServer(scenario)
+
+        with self.assertRaises(asyncio.CancelledError) as caught:
+            await run_in_memory_mcp_session(
+                server,
+                expected_tool_names=frozenset({"fictional_snapshot"}),
+                invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+                timeout_seconds=1.0,
+                lifecycle_adapter=_make_adapter(scenario, server),
+            )
+
+        self.assertEqual(scenario.call_tool_calls, 1)
+        self.assertEqual(caught.exception.args, ())
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+        self.assertEqual(scenario.events[-2:], ["session_exit", "lifespan_exit"])
+        pending = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task() and not task.done()
+        ]
+        self.assertEqual(pending, [])
+
+    async def test_cancellation_survives_lifespan_cleanup_failure(self):
+        scenario = SessionScenario(
+            invocation_error=asyncio.CancelledError(),
+            lifespan_exit_error=RuntimeError("lifespan cleanup failed"),
+        )
+        server = FakeHighLevelServer(scenario)
+
+        with self.assertRaises(asyncio.CancelledError) as caught:
+            await run_in_memory_mcp_session(
+                server,
+                expected_tool_names=frozenset({"fictional_snapshot"}),
+                invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+                timeout_seconds=1.0,
+                lifecycle_adapter=_make_adapter(scenario, server),
+            )
+
+        self.assertEqual(scenario.call_tool_calls, 1)
+        self.assertEqual(caught.exception.args, ())
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+        self.assertEqual(scenario.events[-2:], ["session_exit", "lifespan_exit"])
+        pending = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task() and not task.done()
+        ]
+        self.assertEqual(pending, [])
+
+    async def test_stale_cancellation_chain_does_not_manufacture_cancellation(self):
+        cleanup_errors = []
+        for relationship in ("__cause__", "__context__"):
+            cleanup_error = RuntimeError("stale cleanup detail")
+            setattr(cleanup_error, relationship, asyncio.CancelledError())
+            cleanup_errors.append(cleanup_error)
+
+        for cleanup_error in cleanup_errors:
+            with self.subTest(relationship=(cleanup_error.__cause__ is not None)):
+                scenario = SessionScenario(session_exit_error=cleanup_error)
+                server = FakeHighLevelServer(scenario)
+                receipt = await run_in_memory_mcp_session(
+                    server,
+                    expected_tool_names=frozenset({"fictional_snapshot"}),
+                    invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+                    timeout_seconds=1.0,
+                    lifecycle_adapter=_make_adapter(scenario, server),
+                )
+
+                self.assertEqual(receipt.failure_class, "SHUTDOWN_FAILED")
+                self.assertFalse(receipt.client_closed)
+                self.assertFalse(receipt.server_closed)
+                self.assertFalse(receipt.execution_authority)
+
+    async def test_external_task_cancellation_propagates_without_leaking_tasks(self):
+        scenario = SessionScenario(call_delay=30.0)
+        server = FakeHighLevelServer(scenario)
+        task = asyncio.create_task(
+            run_in_memory_mcp_session(
+                server,
+                expected_tool_names=frozenset({"fictional_snapshot"}),
+                invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+                timeout_seconds=30.0,
+                lifecycle_adapter=_make_adapter(scenario, server),
+            )
+        )
+
+        for _ in range(20):
+            if scenario.call_tool_calls:
+                break
+            await asyncio.sleep(0)
+        self.assertEqual(scenario.call_tool_calls, 1)
+
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        pending = [
+            pending_task
+            for pending_task in asyncio.all_tasks()
+            if pending_task is not asyncio.current_task() and not pending_task.done()
+        ]
+        self.assertEqual(pending, [])
+        self.assertEqual(scenario.events[-2:], ["session_exit", "lifespan_exit"])
 
     async def test_repeated_use_does_not_leak_tasks(self):
         for _ in range(2):
@@ -623,9 +846,34 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
             self.assertEqual(pending, [])
 
     def test_invocation_arguments_are_immutable(self):
-        invocation = MCPInvocation("fictional_snapshot", {"symbol": "SPY"})
+        source = {"symbol": "SPY"}
+        invocation = MCPInvocation("fictional_snapshot", source)
+        source["symbol"] = "QQQ"
+        self.assertEqual(invocation.arguments["symbol"], "SPY")
         with self.assertRaises(TypeError):
             invocation.arguments["symbol"] = "QQQ"  # type: ignore[index]
+
+    def test_invocation_requires_an_existing_mapping_before_copy(self):
+        non_mappings = (
+            [("symbol", "SPY")],
+            (("symbol", "SPY"),),
+            iter((("symbol", "SPY"),)),
+            "symbol=SPY",
+            123,
+            1.5,
+            True,
+            None,
+        )
+        for arguments in non_mappings:
+            with self.subTest(arguments_type=type(arguments).__name__):
+                with self.assertRaises(TypeError):
+                    MCPInvocation("fictional_snapshot", arguments)  # type: ignore[arg-type]
+
+        invocation = MCPInvocation(
+            "fictional_snapshot",
+            MappingProxyType({"symbol": "SPY"}),
+        )
+        self.assertEqual(dict(invocation.arguments), {"symbol": "SPY"})
 
     def test_receipt_is_value_free_and_immutable(self):
         receipt = MCPSessionReceipt(
@@ -647,6 +895,81 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         self.assertEqual(receipt.failure_class, "NONE")
         with self.assertRaises(Exception):
             receipt.failure_class = "TIMEOUT"  # type: ignore[misc]
+
+    async def test_scenario_1_both_exits_succeed_reports_both_closed(self):
+        scenario = SessionScenario()
+        server = FakeHighLevelServer(scenario)
+        adapter = _make_adapter(scenario, server)
+
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"fictional_snapshot"}),
+            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            timeout_seconds=1.0,
+            lifecycle_adapter=adapter,
+        )
+
+        self.assertEqual(receipt.failure_class, "NONE")
+        self.assertTrue(receipt.client_closed)
+        self.assertTrue(receipt.server_closed)
+        self.assertFalse(receipt.execution_authority)
+
+    async def test_scenario_2_session_exit_fails_lifespan_exits_reports_neither_closed(self):
+        scenario = SessionScenario(session_exit_error=RuntimeError("session shutdown failed"))
+        server = FakeHighLevelServer(scenario)
+        adapter = _make_adapter(scenario, server)
+
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"fictional_snapshot"}),
+            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            timeout_seconds=1.0,
+            lifecycle_adapter=adapter,
+        )
+
+        self.assertEqual(receipt.failure_class, "SHUTDOWN_FAILED")
+        self.assertFalse(receipt.client_closed)
+        self.assertFalse(receipt.server_closed)
+        self.assertFalse(receipt.execution_authority)
+
+    async def test_scenario_3_session_exits_lifespan_shutdown_fails_reports_client_closed_only(self):
+        scenario = SessionScenario(lifespan_exit_error=RuntimeError("lifespan shutdown failed"))
+        server = FakeHighLevelServer(scenario)
+        adapter = _make_adapter(scenario, server)
+
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"fictional_snapshot"}),
+            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            timeout_seconds=1.0,
+            lifecycle_adapter=adapter,
+        )
+
+        self.assertEqual(receipt.failure_class, "SHUTDOWN_FAILED")
+        self.assertTrue(receipt.client_closed)
+        self.assertFalse(receipt.server_closed)
+        self.assertFalse(receipt.execution_authority)
+
+    async def test_scenario_4_both_exit_failures_report_neither_closed(self):
+        scenario = SessionScenario(
+            session_exit_error=RuntimeError("session shutdown failed"),
+            lifespan_exit_error=RuntimeError("lifespan shutdown failed"),
+        )
+        server = FakeHighLevelServer(scenario)
+        adapter = _make_adapter(scenario, server)
+
+        receipt = await run_in_memory_mcp_session(
+            server,
+            expected_tool_names=frozenset({"fictional_snapshot"}),
+            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            timeout_seconds=1.0,
+            lifecycle_adapter=adapter,
+        )
+
+        self.assertEqual(receipt.failure_class, "SHUTDOWN_FAILED")
+        self.assertFalse(receipt.client_closed)
+        self.assertFalse(receipt.server_closed)
+        self.assertFalse(receipt.execution_authority)
 
 
 if __name__ == "__main__":
