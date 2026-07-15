@@ -1,15 +1,14 @@
-"""Reusable in-memory MCP session harness.
+"""Sealed snapshot runtime over a private in-memory MCP protocol harness.
 
-The harness is intentionally transport-focused and keeps all Webull-specific
-state out of the module boundary. It can run against a fictional FastMCP-like
-test double or against the sealed Webull composition when the caller supplies
-the matching lifecycle adapter.
+The public entrypoint accepts only the snapshot-only composition capability.
+Generic lifecycle and fictional transport injection remain private test seams.
 """
 
 from __future__ import annotations
 
 import asyncio
 import importlib
+import re
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
@@ -17,7 +16,17 @@ from datetime import timedelta
 from types import MappingProxyType
 from typing import Any, Callable, Optional, Tuple
 
+from selfbull.mcp_one_tool_composition import (
+    CompositionReceipt,
+    SNAPSHOT_TOOL_NAME,
+    SnapshotOnlyServer,
+    _LifecycleServerCapability,
+    _LowLevelLifecycleCapability,
+)
+
 SCHEMA_VERSION = "004B.mcp-session-harness.v2"
+_SNAPSHOT_TOOL_NAMES = frozenset({SNAPSHOT_TOOL_NAME})
+_CANONICAL_STOCK_SYMBOL = re.compile(r"^[A-Z][A-Z0-9.-]{0,9}$")
 
 ALLOWED_FAILURE_CLASSES = frozenset(
     {
@@ -39,7 +48,7 @@ ALLOWED_FAILURE_CLASSES = frozenset(
 
 
 @dataclass(frozen=True)
-class MCPInvocation:
+class _MCPInvocation:
     tool_name: str
     arguments: Mapping[str, Any] = field(default_factory=dict)
 
@@ -68,7 +77,7 @@ class MCPSessionReceipt:
 
 
 @dataclass(frozen=True)
-class MCPLifecycleAdapter:
+class _MCPLifecycleAdapter:
     lifespan_context_factory: Callable[[Any], Any]
     low_level_server_resolver: Callable[[Any], Any]
     connected_session_factory: Callable[[Any, float], Any]
@@ -146,8 +155,8 @@ def _default_connected_session_factory(low_level_server: Any, timeout_seconds: f
     )
 
 
-def _default_lifecycle_adapter() -> MCPLifecycleAdapter:
-    return MCPLifecycleAdapter(
+def _default_lifecycle_adapter() -> _MCPLifecycleAdapter:
+    return _MCPLifecycleAdapter(
         lifespan_context_factory=_default_lifespan_context_factory,
         low_level_server_resolver=_default_low_level_server_resolver,
         connected_session_factory=_default_connected_session_factory,
@@ -246,7 +255,7 @@ def _admit_invocation_arguments(tool: Any, arguments: Mapping[str, Any]) -> dict
     if not isinstance(arguments, Mapping) or set(arguments) != {"symbol"}:
         raise _SchemaAdmissionError("unsupported canonical arguments")
     symbol = arguments.get("symbol")
-    if not isinstance(symbol, str) or not symbol.strip():
+    if type(symbol) is not str or _CANONICAL_STOCK_SYMBOL.fullmatch(symbol) is None:
         raise _SchemaAdmissionError("invalid canonical symbol")
 
     return {"symbols": symbol}
@@ -314,7 +323,7 @@ async def _run_session_protocol(
     session: Any,
     *,
     expected_tool_names: frozenset[str],
-    invocation: Optional[MCPInvocation],
+    invocation: Optional[_MCPInvocation],
     timeout_seconds: float,
 ) -> MCPSessionReceipt:
     invocation_requested = invocation is not None
@@ -443,15 +452,15 @@ async def _run_session_protocol(
     )
 
 
-async def run_in_memory_mcp_session(
+async def _run_in_memory_mcp_session(
     server: Any,
     *,
     expected_tool_names: frozenset[str],
-    invocation: Optional[MCPInvocation] = None,
+    invocation: Optional[_MCPInvocation] = None,
     timeout_seconds: float = 30.0,
-    lifecycle_adapter: Optional[MCPLifecycleAdapter] = None,
+    lifecycle_adapter: Optional[_MCPLifecycleAdapter] = None,
 ) -> MCPSessionReceipt:
-    """Run one in-memory MCP session against a FastMCP-like server."""
+    """Private protocol harness for offline lifecycle and refusal testing."""
 
     adapter = lifecycle_adapter or _default_lifecycle_adapter()
     expected_tool_names = frozenset(expected_tool_names)
@@ -577,4 +586,64 @@ async def run_in_memory_mcp_session(
         receipt,
         client_closed=session_exit_completed,
         server_closed=(session_exit_completed and lifespan_exit_completed),
+    )
+
+
+def _require_snapshot_only_server(server: Any) -> SnapshotOnlyServer:
+    """Require the exact sealed capability produced by the composition layer."""
+
+    if type(server) is not SnapshotOnlyServer:
+        raise TypeError("server must be the sealed snapshot-only composition")
+    if type(server.receipt) is not CompositionReceipt:
+        raise TypeError("snapshot-only composition receipt is invalid")
+    if type(server._server) is not _LifecycleServerCapability:
+        raise TypeError("snapshot-only lifecycle capability is invalid")
+    if type(server._server._mcp_server) is not _LowLevelLifecycleCapability:
+        raise TypeError("snapshot-only low-level capability is invalid")
+
+    receipt = server.receipt
+    if not (
+        receipt.visible_tool_names == (SNAPSHOT_TOOL_NAME,)
+        and receipt.discovery_allowlist == _SNAPSHOT_TOOL_NAMES
+        and receipt.invocation_allowlist == _SNAPSHOT_TOOL_NAMES
+        and receipt.forbidden_visible_tool_names == ()
+        and receipt.exact_surface_match is True
+        and receipt.execution_authority is False
+        and receipt.verdict == "SEALED"
+    ):
+        raise TypeError("snapshot-only composition is not sealed")
+    return server
+
+
+async def _run_snapshot_only_mcp_session_with_adapter(
+    server: Any,
+    symbol: str,
+    *,
+    timeout_seconds: float = 30.0,
+    lifecycle_adapter: Optional[_MCPLifecycleAdapter] = None,
+) -> MCPSessionReceipt:
+    """Private injection seam preserving exact snapshot runtime authority."""
+
+    snapshot_server = _require_snapshot_only_server(server)
+    return await _run_in_memory_mcp_session(
+        snapshot_server,
+        expected_tool_names=_SNAPSHOT_TOOL_NAMES,
+        invocation=_MCPInvocation(SNAPSHOT_TOOL_NAME, {"symbol": symbol}),
+        timeout_seconds=timeout_seconds,
+        lifecycle_adapter=lifecycle_adapter,
+    )
+
+
+async def run_snapshot_only_mcp_session(
+    server: SnapshotOnlyServer,
+    symbol: str,
+    *,
+    timeout_seconds: float = 30.0,
+) -> MCPSessionReceipt:
+    """Run the canonical one-tool SELFBULL snapshot session."""
+
+    return await _run_snapshot_only_mcp_session_with_adapter(
+        server,
+        symbol,
+        timeout_seconds=timeout_seconds,
     )

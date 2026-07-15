@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import sys
@@ -13,11 +14,14 @@ from unittest import IsolatedAsyncioTestCase
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 from selfbull.mcp_session_harness import (  # noqa: E402
-    MCPInvocation,
-    MCPLifecycleAdapter,
+    _MCPInvocation,
+    _MCPLifecycleAdapter,
     MCPSessionReceipt,
-    run_in_memory_mcp_session,
+    _run_in_memory_mcp_session,
+    _run_snapshot_only_mcp_session_with_adapter,
+    run_snapshot_only_mcp_session,
 )
+from selfbull.mcp_one_tool_composition import build_snapshot_only_server  # noqa: E402
 
 
 def _stock_snapshot_schema():
@@ -52,6 +56,7 @@ class SessionScenario:
     call_delay: float = 0.0
     events: list[str] = field(default_factory=list)
     call_tool_calls: int = 0
+    call_tool_names: list[str] = field(default_factory=list)
     call_tool_arguments: list[dict] = field(default_factory=list)
     received_low_level_server: object | None = None
     low_level_resolved: bool = False
@@ -106,6 +111,14 @@ class FakeHighLevelServer:
     def _lifespan_manager(self):
         return self._lifespan
 
+    def list_tools(self):
+        return [SimpleNamespace(name=name) for name in self.scenario.visible_tool_names]
+
+    def remove_tool(self, name: str) -> None:
+        if name in self.scenario.visible_tool_names:
+            self.scenario.visible_tool_names.remove(name)
+            self.scenario.tool_schemas.pop(name, None)
+
 
 class FakeClientSession:
     def __init__(self, scenario: SessionScenario, low_level_server: object) -> None:
@@ -137,6 +150,7 @@ class FakeClientSession:
     async def call_tool(self, name, arguments=None, read_timeout_seconds=None, progress_callback=None, *, meta=None):
         self.call_tool_calls += 1
         self.scenario.call_tool_calls += 1
+        self.scenario.call_tool_names.append(name)
         self.scenario.call_tool_arguments.append(dict(arguments or {}))
         self.scenario.events.append("call_tool")
         if self.scenario.invocation_error is not None:
@@ -174,21 +188,24 @@ class FakeSessionContext:
         return False
 
 
-def _make_adapter(scenario: SessionScenario, server: FakeHighLevelServer) -> MCPLifecycleAdapter:
+def _make_adapter(scenario: SessionScenario, server: object) -> _MCPLifecycleAdapter:
+    wrapper = getattr(server, "_server", server)
+    expected_low_level_server = wrapper._mcp_server
+
     def lifespan_context_factory(seen_server: object):
         assert seen_server is server
-        return server._lifespan_manager()
+        return wrapper._lifespan_manager()
 
     def low_level_server_resolver(seen_server: object):
         assert seen_server is server
         scenario.low_level_resolved = True
         scenario.events.append("resolve_low_level")
-        return server._mcp_server
+        return expected_low_level_server
 
     def connected_session_factory(low_level_server: object, timeout_seconds: float):
         scenario.received_low_level_server = low_level_server
         scenario.events.append("connected_session_factory")
-        if low_level_server is not server._mcp_server:
+        if low_level_server is not expected_low_level_server:
             raise AssertionError("connected_session_factory received the wrong server")
         if scenario.session_factory_error is not None:
             raise scenario.session_factory_error
@@ -201,11 +218,20 @@ def _make_adapter(scenario: SessionScenario, server: FakeHighLevelServer) -> MCP
 
         return _session_context()
 
-    return MCPLifecycleAdapter(
+    return _MCPLifecycleAdapter(
         lifespan_context_factory=lifespan_context_factory,
         low_level_server_resolver=low_level_server_resolver,
         connected_session_factory=connected_session_factory,
     )
+
+
+def _sealed_snapshot_server(scenario: SessionScenario):
+    raw_server = FakeHighLevelServer(scenario)
+    sealed_server = build_snapshot_only_server(
+        config=object(),
+        build_server_fn=lambda _config: raw_server,
+    )
+    return sealed_server
 
 
 class TestMCPSessionHarness(IsolatedAsyncioTestCase):
@@ -215,24 +241,150 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
             tool_schemas={"get_stock_snapshot": schema},
         )
         server = FakeHighLevelServer(scenario)
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"get_stock_snapshot"}),
-            invocation=MCPInvocation("get_stock_snapshot", arguments),
+            invocation=_MCPInvocation("get_stock_snapshot", arguments),
             timeout_seconds=1.0,
             lifecycle_adapter=_make_adapter(scenario, server),
         )
         return receipt, scenario
+
+    def test_public_runtime_signature_has_no_generic_authority_parameters(self):
+        parameters = inspect.signature(run_snapshot_only_mcp_session).parameters
+        self.assertEqual(
+            tuple(parameters),
+            ("server", "symbol", "timeout_seconds"),
+        )
+        for forbidden_parameter in (
+            "expected_tool_names",
+            "tool_name",
+            "invocation",
+            "lifecycle_adapter",
+        ):
+            self.assertNotIn(forbidden_parameter, parameters)
+
+    async def test_public_runtime_refuses_arbitrary_server_authority(self):
+        scenario = SessionScenario(
+            visible_tool_names=["get_stock_snapshot"],
+            tool_schemas={"get_stock_snapshot": _stock_snapshot_schema()},
+        )
+        arbitrary_server = FakeHighLevelServer(scenario)
+
+        with self.assertRaises(TypeError):
+            await run_snapshot_only_mcp_session(arbitrary_server, "SPY")  # type: ignore[arg-type]
+
+        self.assertEqual(scenario.events, [])
+        self.assertEqual(scenario.call_tool_calls, 0)
+
+    def test_public_runtime_refuses_tool_and_allowlist_substitution(self):
+        substitutions = (
+            {"tool_name": "fictional_snapshot"},
+            {"tool_name": "get_stock_bars_single"},
+            {"expected_tool_names": frozenset({"fictional_snapshot"})},
+            {"expected_tool_names": frozenset({"get_stock_bars_single"})},
+        )
+        for substitution in substitutions:
+            with self.subTest(substitution=substitution), self.assertRaises(TypeError):
+                run_snapshot_only_mcp_session(object(), "SPY", **substitution)  # type: ignore[arg-type,call-arg]
+
+    async def test_private_injection_seam_preserves_exact_public_authority(self):
+        scenario = SessionScenario(
+            visible_tool_names=["get_stock_snapshot"],
+            tool_schemas={"get_stock_snapshot": _stock_snapshot_schema()},
+        )
+        server = _sealed_snapshot_server(scenario)
+
+        receipt = await _run_snapshot_only_mcp_session_with_adapter(
+            server,
+            "SPY",
+            timeout_seconds=1.0,
+            lifecycle_adapter=_make_adapter(scenario, server),
+        )
+
+        self.assertEqual(receipt.failure_class, "NONE")
+        self.assertEqual(receipt.visible_tool_names, ("get_stock_snapshot",))
+        self.assertEqual(receipt.invoked_tool_name, "get_stock_snapshot")
+        self.assertEqual(scenario.call_tool_names, ["get_stock_snapshot"])
+        self.assertEqual(scenario.call_tool_arguments, [{"symbols": "SPY"}])
+        self.assertEqual(receipt.broker_request_count, 1)
+        self.assertFalse(receipt.execution_authority)
+
+    async def test_public_runtime_detects_surface_drift_before_invocation(self):
+        scenario = SessionScenario(
+            visible_tool_names=["get_stock_snapshot"],
+            tool_schemas={"get_stock_snapshot": _stock_snapshot_schema()},
+        )
+        server = _sealed_snapshot_server(scenario)
+        scenario.visible_tool_names.append("get_stock_bars_single")
+        scenario.tool_schemas["get_stock_bars_single"] = _stock_snapshot_schema()
+
+        receipt = await _run_snapshot_only_mcp_session_with_adapter(
+            server,
+            "SPY",
+            timeout_seconds=1.0,
+            lifecycle_adapter=_make_adapter(scenario, server),
+        )
+
+        self.assertEqual(receipt.failure_class, "SURFACE_MISMATCH")
+        self.assertEqual(scenario.call_tool_calls, 0)
+        self.assertNotIn("call_tool", scenario.events)
+        self.assertFalse(receipt.execution_authority)
+
+    async def test_single_symbol_grammar_admits_only_canonical_stock_symbols(self):
+        for symbol in ("SPY", "QQQ", "BRK.B", "BRK-B"):
+            with self.subTest(symbol=symbol):
+                arguments = {"symbol": symbol}
+                receipt, scenario = await self._run_schema_case(
+                    _stock_snapshot_schema(), arguments
+                )
+                self.assertEqual(receipt.failure_class, "NONE")
+                self.assertEqual(scenario.call_tool_names, ["get_stock_snapshot"])
+                self.assertEqual(scenario.call_tool_arguments, [{"symbols": symbol}])
+                self.assertEqual(arguments, {"symbol": symbol})
+                self.assertFalse(receipt.execution_authority)
+
+    async def test_single_symbol_grammar_refuses_hostile_and_ambiguous_values(self):
+        invalid_symbols = (
+            "SPY,QQQ",
+            "SPY QQQ",
+            "SPY;QQQ",
+            "SPY|QQQ",
+            "SPY/QQQ",
+            "SPY\\QQQ",
+            "SPY\nQQQ",
+            " SPY",
+            "SPY ",
+            "SPY\u00a0",
+            "spy",
+            "",
+            ",",
+            "SPY,",
+            ",SPY",
+            "AAPL=SECRET",
+            "SPY\x00",
+        )
+        for symbol in invalid_symbols:
+            with self.subTest(symbol=repr(symbol)):
+                arguments = {"symbol": symbol}
+                receipt, scenario = await self._run_schema_case(
+                    _stock_snapshot_schema(), arguments
+                )
+                self.assertEqual(receipt.failure_class, "SCHEMA_ADMISSION_FAILED")
+                self.assertEqual(scenario.call_tool_calls, 0)
+                self.assertEqual(scenario.call_tool_names, [])
+                self.assertEqual(arguments, {"symbol": symbol})
+                self.assertFalse(receipt.execution_authority)
 
     async def test_fictional_harness_runs_successfully_offline(self):
         scenario = SessionScenario()
         server = FakeHighLevelServer(scenario)
         adapter = _make_adapter(scenario, server)
 
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"fictional_snapshot"}),
-            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
             timeout_seconds=1.0,
             lifecycle_adapter=adapter,
         )
@@ -277,10 +429,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         adapter = _make_adapter(scenario, server)
 
         arguments = {"symbol": "SPY"}
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"get_stock_snapshot"}),
-            invocation=MCPInvocation("get_stock_snapshot", arguments),
+            invocation=_MCPInvocation("get_stock_snapshot", arguments),
             timeout_seconds=1.0,
             lifecycle_adapter=adapter,
         )
@@ -389,10 +541,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         server = FakeHighLevelServer(scenario)
         adapter = _make_adapter(scenario, server)
 
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"fictional_snapshot"}),
-            invocation=MCPInvocation("fictional_mutation", {"name": "Tech Stocks"}),
+            invocation=_MCPInvocation("fictional_mutation", {"name": "Tech Stocks"}),
             timeout_seconds=1.0,
             lifecycle_adapter=adapter,
         )
@@ -419,10 +571,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         server = FakeHighLevelServer(scenario)
         adapter = _make_adapter(scenario, server)
 
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"fictional_snapshot"}),
-            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
             timeout_seconds=1.0,
             lifecycle_adapter=adapter,
         )
@@ -450,7 +602,7 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
                 )
                 server = FakeHighLevelServer(scenario)
 
-                receipt = await run_in_memory_mcp_session(
+                receipt = await _run_in_memory_mcp_session(
                     server,
                     expected_tool_names=frozenset({"fictional_snapshot"}),
                     timeout_seconds=1.0,
@@ -468,10 +620,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         server = FakeHighLevelServer(scenario)
         adapter = _make_adapter(scenario, server)
 
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"fictional_snapshot"}),
-            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
             timeout_seconds=0.001,
             lifecycle_adapter=adapter,
         )
@@ -488,10 +640,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         server = FakeHighLevelServer(scenario)
         adapter = _make_adapter(scenario, server)
 
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"fictional_snapshot"}),
-            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
             timeout_seconds=1.0,
             lifecycle_adapter=adapter,
         )
@@ -507,10 +659,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         server = FakeHighLevelServer(scenario)
         adapter = _make_adapter(scenario, server)
 
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"fictional_snapshot"}),
-            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
             timeout_seconds=1.0,
             lifecycle_adapter=adapter,
         )
@@ -526,10 +678,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         server = FakeHighLevelServer(scenario)
         adapter = _make_adapter(scenario, server)
 
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"fictional_snapshot"}),
-            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
             timeout_seconds=1.0,
             lifecycle_adapter=adapter,
         )
@@ -543,10 +695,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         server = FakeHighLevelServer(scenario)
         adapter = _make_adapter(scenario, server)
 
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"fictional_snapshot"}),
-            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
             timeout_seconds=1.0,
             lifecycle_adapter=adapter,
         )
@@ -564,10 +716,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         server = FakeHighLevelServer(scenario)
         adapter = _make_adapter(scenario, server)
 
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"fictional_snapshot"}),
-            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
             timeout_seconds=1.0,
             lifecycle_adapter=adapter,
         )
@@ -594,16 +746,16 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         def connected_session_factory(low_level_server: object, timeout_seconds: float):
             raise AssertionError("should not be reached")
 
-        adapter = MCPLifecycleAdapter(
+        adapter = _MCPLifecycleAdapter(
             lifespan_context_factory=lifespan_context_factory,
             low_level_server_resolver=low_level_server_resolver,
             connected_session_factory=connected_session_factory,
         )
 
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"fictional_snapshot"}),
-            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
             timeout_seconds=1.0,
             lifecycle_adapter=adapter,
         )
@@ -618,10 +770,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         server = FakeHighLevelServer(scenario)
         adapter = _make_adapter(scenario, server)
 
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"fictional_snapshot"}),
-            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
             timeout_seconds=1.0,
             lifecycle_adapter=adapter,
         )
@@ -644,10 +796,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         )
         server = FakeHighLevelServer(scenario)
 
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"fictional_snapshot"}),
-            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
             timeout_seconds=1.0,
             lifecycle_adapter=_make_adapter(scenario, server),
         )
@@ -668,10 +820,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         scenario = SessionScenario(session_enter_error=RuntimeError("session start failed"))
         server = FakeHighLevelServer(scenario)
 
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"fictional_snapshot"}),
-            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
             timeout_seconds=1.0,
             lifecycle_adapter=_make_adapter(scenario, server),
         )
@@ -696,10 +848,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
             with self.subTest(scenario=scenario):
                 server = FakeHighLevelServer(scenario)
                 with self.assertRaises(asyncio.CancelledError):
-                    await run_in_memory_mcp_session(
+                    await _run_in_memory_mcp_session(
                         server,
                         expected_tool_names=frozenset({"fictional_snapshot"}),
-                        invocation=MCPInvocation(
+                        invocation=_MCPInvocation(
                             "fictional_snapshot", {"symbol": "SPY"}
                         ),
                         timeout_seconds=1.0,
@@ -721,10 +873,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         server = FakeHighLevelServer(scenario)
 
         with self.assertRaises(asyncio.CancelledError) as caught:
-            await run_in_memory_mcp_session(
+            await _run_in_memory_mcp_session(
                 server,
                 expected_tool_names=frozenset({"fictional_snapshot"}),
-                invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+                invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
                 timeout_seconds=1.0,
                 lifecycle_adapter=_make_adapter(scenario, server),
             )
@@ -749,10 +901,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         server = FakeHighLevelServer(scenario)
 
         with self.assertRaises(asyncio.CancelledError) as caught:
-            await run_in_memory_mcp_session(
+            await _run_in_memory_mcp_session(
                 server,
                 expected_tool_names=frozenset({"fictional_snapshot"}),
-                invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+                invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
                 timeout_seconds=1.0,
                 lifecycle_adapter=_make_adapter(scenario, server),
             )
@@ -780,10 +932,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
             with self.subTest(relationship=(cleanup_error.__cause__ is not None)):
                 scenario = SessionScenario(session_exit_error=cleanup_error)
                 server = FakeHighLevelServer(scenario)
-                receipt = await run_in_memory_mcp_session(
+                receipt = await _run_in_memory_mcp_session(
                     server,
                     expected_tool_names=frozenset({"fictional_snapshot"}),
-                    invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+                    invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
                     timeout_seconds=1.0,
                     lifecycle_adapter=_make_adapter(scenario, server),
                 )
@@ -797,10 +949,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         scenario = SessionScenario(call_delay=30.0)
         server = FakeHighLevelServer(scenario)
         task = asyncio.create_task(
-            run_in_memory_mcp_session(
+            _run_in_memory_mcp_session(
                 server,
                 expected_tool_names=frozenset({"fictional_snapshot"}),
-                invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+                invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
                 timeout_seconds=30.0,
                 lifecycle_adapter=_make_adapter(scenario, server),
             )
@@ -829,10 +981,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
             scenario = SessionScenario()
             server = FakeHighLevelServer(scenario)
             adapter = _make_adapter(scenario, server)
-            receipt = await run_in_memory_mcp_session(
+            receipt = await _run_in_memory_mcp_session(
                 server,
                 expected_tool_names=frozenset({"fictional_snapshot"}),
-                invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+                invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
                 timeout_seconds=1.0,
                 lifecycle_adapter=adapter,
             )
@@ -847,7 +999,7 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
 
     def test_invocation_arguments_are_immutable(self):
         source = {"symbol": "SPY"}
-        invocation = MCPInvocation("fictional_snapshot", source)
+        invocation = _MCPInvocation("fictional_snapshot", source)
         source["symbol"] = "QQQ"
         self.assertEqual(invocation.arguments["symbol"], "SPY")
         with self.assertRaises(TypeError):
@@ -867,9 +1019,9 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         for arguments in non_mappings:
             with self.subTest(arguments_type=type(arguments).__name__):
                 with self.assertRaises(TypeError):
-                    MCPInvocation("fictional_snapshot", arguments)  # type: ignore[arg-type]
+                    _MCPInvocation("fictional_snapshot", arguments)  # type: ignore[arg-type]
 
-        invocation = MCPInvocation(
+        invocation = _MCPInvocation(
             "fictional_snapshot",
             MappingProxyType({"symbol": "SPY"}),
         )
@@ -901,10 +1053,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         server = FakeHighLevelServer(scenario)
         adapter = _make_adapter(scenario, server)
 
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"fictional_snapshot"}),
-            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
             timeout_seconds=1.0,
             lifecycle_adapter=adapter,
         )
@@ -919,10 +1071,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         server = FakeHighLevelServer(scenario)
         adapter = _make_adapter(scenario, server)
 
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"fictional_snapshot"}),
-            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
             timeout_seconds=1.0,
             lifecycle_adapter=adapter,
         )
@@ -937,10 +1089,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         server = FakeHighLevelServer(scenario)
         adapter = _make_adapter(scenario, server)
 
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"fictional_snapshot"}),
-            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
             timeout_seconds=1.0,
             lifecycle_adapter=adapter,
         )
@@ -958,10 +1110,10 @@ class TestMCPSessionHarness(IsolatedAsyncioTestCase):
         server = FakeHighLevelServer(scenario)
         adapter = _make_adapter(scenario, server)
 
-        receipt = await run_in_memory_mcp_session(
+        receipt = await _run_in_memory_mcp_session(
             server,
             expected_tool_names=frozenset({"fictional_snapshot"}),
-            invocation=MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
+            invocation=_MCPInvocation("fictional_snapshot", {"symbol": "SPY"}),
             timeout_seconds=1.0,
             lifecycle_adapter=adapter,
         )
