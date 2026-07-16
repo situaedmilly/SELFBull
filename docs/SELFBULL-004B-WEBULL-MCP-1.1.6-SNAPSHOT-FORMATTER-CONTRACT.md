@@ -231,10 +231,10 @@ Required parsing sequence:
 ```text
 verify transport receipt
 -> verify raw witness reference
+-> verify MCP envelope (extract structuredContent.result)
 -> scan complete formatter text for secret patterns
 -> scan complete formatter text for identity patterns
 -> verify package version and source hashes
--> verify MCP envelope
 -> split lines without discarding the empty disclaimer separator
 -> require exactly seven lines
 -> verify disclaimer class and exact stock-snapshot header
