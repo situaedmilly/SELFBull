@@ -5,6 +5,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -36,8 +37,10 @@ from selfbull.mcp_inventory import (  # noqa: E402
     InventoryParseError,
     InventorySafetyError,
     ProcessOutcome,
+    _ProcessGroupTerminationError,
     _ReceiptWriteError,
     _run_process,
+    _terminate_process_group,
     inspect_inventory,
     parse_inventory_output,
 )
@@ -187,8 +190,12 @@ class TestImmutableCommand(unittest.TestCase):
 
 
 class TestProcessGroupTimeout(unittest.TestCase):
-    def test_parent_and_child_are_killed_and_reaped(self):
-        child_code = "import time; time.sleep(60)"
+    def test_parent_exit_does_not_spare_sigterm_resistant_child(self):
+        child_code = (
+            "import signal,time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(60)"
+        )
         parent_code = (
             "import subprocess,sys,time; "
             "child=subprocess.Popen([sys.executable,'-c',sys.argv[1]]); "
@@ -212,6 +219,114 @@ class TestProcessGroupTimeout(unittest.TestCase):
                 time.sleep(0.05)
             self.assertTrue(outcome.timed_out)
             self.assertFalse(pid_exists(child_pid))
+
+    def test_sigkill_resistant_group_is_a_controlled_termination_failure(self):
+        class ReapedParent:
+            pid = 424242
+
+            def __init__(self):
+                self.wait_calls = 0
+
+            def wait(self, timeout):
+                self.wait_calls += 1
+                return -signal.SIGTERM
+
+        process = ReapedParent()
+        signals = []
+
+        def record_killpg(process_group_id, sent_signal):
+            signals.append((process_group_id, sent_signal))
+
+        with self.assertRaises(_ProcessGroupTerminationError):
+            _terminate_process_group(
+                process,  # type: ignore[arg-type]
+                grace_period=0,
+                killpg=record_killpg,
+                group_exists=lambda _pid: True,
+            )
+
+        self.assertEqual(process.wait_calls, 1)
+        self.assertEqual(
+            signals,
+            [
+                (process.pid, signal.SIGTERM),
+                (process.pid, signal.SIGKILL),
+            ],
+        )
+
+    def test_process_group_already_absent_is_reaped_without_escalation(self):
+        class ReapedParent:
+            pid = 424243
+
+            def __init__(self):
+                self.wait_calls = 0
+
+            def wait(self, timeout):
+                self.wait_calls += 1
+                return 0
+
+        process = ReapedParent()
+
+        def absent_killpg(_process_group_id, _sent_signal):
+            raise ProcessLookupError
+
+        returncode = _terminate_process_group(
+            process,  # type: ignore[arg-type]
+            grace_period=0,
+            killpg=absent_killpg,
+            group_exists=lambda _pid: False,
+        )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(process.wait_calls, 1)
+
+    def test_sigkill_process_lookup_race_still_requires_absence_proof(self):
+        class ReapedParent:
+            pid = 424244
+
+            def wait(self, timeout):
+                return -signal.SIGTERM
+
+        process = ReapedParent()
+        signals = []
+        group_states = iter((True, False))
+
+        def racing_killpg(process_group_id, sent_signal):
+            signals.append((process_group_id, sent_signal))
+            if sent_signal == signal.SIGKILL:
+                raise ProcessLookupError
+
+        returncode = _terminate_process_group(
+            process,  # type: ignore[arg-type]
+            grace_period=0,
+            killpg=racing_killpg,
+            group_exists=lambda _pid: next(group_states),
+        )
+
+        self.assertEqual(returncode, -signal.SIGTERM)
+        self.assertEqual(
+            signals,
+            [
+                (process.pid, signal.SIGTERM),
+                (process.pid, signal.SIGKILL),
+            ],
+        )
+
+    def test_unproven_group_absence_is_a_controlled_public_timeout(self):
+        def runner(*_args, **_kwargs):
+            raise _ProcessGroupTerminationError("fictional descendant detail")
+
+        with tempfile.TemporaryDirectory() as parent:
+            result = inspect_inventory(
+                env=environment(),
+                process_runner=runner,
+                temp_parent=Path(parent),
+            )
+            self.assertEqual(list(Path(parent).iterdir()), [])
+
+        self.assertEqual(result["status"], STATUS_TIMEOUT)
+        self.assertEqual(result["failure_class"], FAILURE_PROCESS_TIMEOUT)
+        self.assertNotIn("fictional descendant detail", json.dumps(result))
 
     def test_timeout_is_a_controlled_public_result(self):
         def runner(*_args, **_kwargs):
